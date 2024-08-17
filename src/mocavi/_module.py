@@ -2,7 +2,6 @@
 
 from collections.abc import Iterable
 
-import numpy as np
 import torch
 from scvi import REGISTRY_KEYS
 from scvi.distributions import NegativeBinomial, NegativeBinomialMixture, Poisson
@@ -18,19 +17,42 @@ torch.backends.cudnn.benchmark = True
 
 class MoCAVIModule(BaseModuleClass):
     """
-    PyTorch module for MoCAVI.
+    PyTorch module for Multi-modal Contrastive Analysis via Variational Inference (MoCAVI).
+
+    This module implements the core neural network architecture for the MoCAVI model,
+    including encoders and decoders for gene expression, chromatin accessibility,
+    and protein expression data.
 
     Args:
     ----
-        n_input: Number of input genes.
-        n_batch: Number of batches. If 0, no batch effect correction is performed.
-        n_hidden: Number of nodes per hidden layer.
-        n_background_latent: Dimensionality of the background latent space.
-        n_salient_latent: Dimensionality of the salient latent space.
-        n_layers: Number of hidden layers used for encoder and decoder NNs.
-        dropout_rate: Dropout rate for neural networks.
-        disentanglement_penalty: Weight of the disentanglement loss that further
-            discourages shared variations from leaking into the salient latent space.
+    n_input_genes : int
+        Number of input genes.
+    n_input_regions : int
+        Number of input chromatin accessibility regions.
+    n_input_proteins : int
+        Number of input proteins.
+    n_labels : int
+        Number of labels (e.g., perturbation conditions).
+    n_batch : int, optional
+        Number of batches. If 0, no batch effect correction is performed (default is 0).
+    n_hidden : int, optional
+        Number of nodes per hidden layer in encoder and decoder networks (default is 128).
+    n_background_latent : int, optional
+        Dimensionality of the background latent space (default is 10).
+    n_salient_latent : int, optional
+        Dimensionality of the salient latent space (default is 10).
+    n_layers_encoder : int, optional
+        Number of hidden layers in encoder networks (default is 1).
+    n_layers_decoder : int, optional
+        Number of hidden layers in decoder networks (default is 1).
+    n_continuous_cov : int, optional
+        Number of continuous covariates (default is 0).
+    n_cats_per_cov : Iterable[int] | None, optional
+        Number of categories for each categorical covariate (default is None).
+    dropout_rate : float, optional
+        Dropout rate for neural networks (default is 0.1).
+    wasserstein_reg : float, optional
+        Weight of the Wasserstein regularization (default is 0).
     """
 
     def __init__(
@@ -48,8 +70,6 @@ class MoCAVIModule(BaseModuleClass):
         n_continuous_cov: int = 0,
         n_cats_per_cov: Iterable[int] | None = None,
         dropout_rate: float = 0.1,
-        protein_background_prior_mean: np.ndarray | None = None,
-        protein_background_prior_scale: np.ndarray | None = None,
         wasserstein_reg: float = 0,
     ) -> None:
         super().__init__()
@@ -569,7 +589,6 @@ class MoCAVIModule(BaseModuleClass):
         inference_outputs: dict[str, torch.Tensor],
         generative_outputs: dict[str, torch.Tensor],
         use_chem_prior: bool = False,
-        weight_obs: bool = False,
     ) -> dict[str, torch.Tensor]:
         x = tensors[REGISTRY_KEYS.X_KEY]
         x_rna = x[:, : self.n_input_genes]

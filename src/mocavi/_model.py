@@ -40,16 +40,30 @@ class MoCAVIModel(MoCAVITrainingMixin, BaseModelClass):
 
     Args:
     ----
-        adata: AnnData object that has been registered via
-            `MoCAVIModel.setup_anndata`.
-        n_batch: Number of batches. If 0, no batch effect correction is performed.
-        n_hidden: Number of nodes per hidden layer.
-        n_latent: Dimensionality of the latent space.
-        n_layers: Number of hidden layers used for encoder and decoder NNs.
-        dropout_rate: Dropout rate for neural networks.
-        use_observed_lib_size: Use observed library size for RNA as scaling factor in
-            mean of conditional distribution.
-
+        adata : AnnData
+        AnnData object that has been registered via `MoCAVIModel.setup_anndata`.
+        n_genes : int
+            Number of genes in the dataset.
+        n_regions : int
+            Number of genomic regions (for ATAC-seq data).
+        n_batch : int, optional
+            Number of batches. If 0, no batch effect correction is performed (default is 0).
+        n_hidden : int, optional
+            Number of nodes per hidden layer (default is 128).
+        n_background_latent : int
+            Dimensionality of the background latent space (default is 10).
+        n_salient_latent : int
+            Dimensionality of the salient latent space (default is 10).
+        n_layers_encoder : int
+            Number of hidden layers used for encoder neural networks (default is 1).
+        n_layers_decoder : int
+            Number of hidden layers used for decoder neural networks (default is 1).
+        dropout_rate : float
+            Dropout rate for neural networks (default is 0.1).
+        reweighting_mode : str, optional
+            Mode for reweighting. Options are "bt" (batch-target) or "auto" (default is "auto").
+        wasserstein_reg : float, optional
+            Strenght parameter for Wasserstein regularization (default is 0).
     """
 
     def __init__(
@@ -64,7 +78,7 @@ class MoCAVIModel(MoCAVITrainingMixin, BaseModelClass):
         n_layers_encoder: int = 1,
         n_layers_decoder: int = 1,
         dropout_rate: float = 0.1,
-        reweighting_mode: str = "bt",
+        reweighting_mode: str = "auto",
         wasserstein_reg: float = 0,
     ) -> None:
         super().__init__(adata)
@@ -126,7 +140,6 @@ class MoCAVIModel(MoCAVITrainingMixin, BaseModelClass):
         layer: str | None = None,
         batch_key: str | None = None,
         labels_key: str | None = None,
-        size_factor_key: str | None = None,
         categorical_covariate_keys: list[str] | None = None,
         continuous_covariate_keys: list[str] | None = None,
         **kwargs,
@@ -138,6 +151,9 @@ class MoCAVIModel(MoCAVITrainingMixin, BaseModelClass):
         ----
             adata: AnnData object containing raw counts. Rows represent cells, columns
                 represent features.
+            protein_expression_obsm_key: Key in `adata.obsm` where protein expression data is stored.
+            protein_names_uns_key: Key in `adata.uns` where protein names are stored.
+                If None, protein names are inferred from the protein expression data (default is None).
             layer: If not None, uses this as the key in adata.layers for raw count data.
             batch_key: Key in `adata.obs` for batch information. Categories will
                 automatically be converted into integer categories and saved to
@@ -147,10 +163,6 @@ class MoCAVIModel(MoCAVITrainingMixin, BaseModelClass):
                 automatically be converted into integer categories and saved to
                 `adata.obs["_scvi_labels"]`. If None, assign the same label to all the
                 data.
-            size_factor_key: Key in `adata.obs` for size factor information. Instead of
-                using library size as a size factor, the provided size factor column
-                will be used as offset in the mean of the likelihood. Assumed to be on
-                linear scale.
             categorical_covariate_keys: Keys in `adata.obs` corresponding to categorical
                 data. Used in some models.
             continuous_covariate_keys: Keys in `adata.obs` corresponding to continuous
@@ -205,7 +217,12 @@ class MoCAVIModel(MoCAVITrainingMixin, BaseModelClass):
 
         Returns
         -------
-            A numpy array with shape `(n_cells, n_latent)`.
+        dict[str, np.ndarray]
+            A dictionary containing three numpy arrays, each with shape (n_cells,):
+            - 'exp': Importance of gene expression for each cell's latent representation.
+            - 'chr': Importance of chromatin accessibility for each cell's latent representation.
+            - 'pro': Importance of protein expression for each cell's latent representation.
+
         """
         available_representation_kinds = ["background", "salient"]
         assert representation_kind in available_representation_kinds, (
@@ -286,6 +303,8 @@ class MoCAVIModel(MoCAVITrainingMixin, BaseModelClass):
             `scvi.settings.batch_size`.
         representation_kind: Either "background" or "salient" for the corresponding
             representation kind.
+        partial_modality: If not None, return the latent representation for the
+            specified modality. One of ["exp", "pro", "chr"].
 
         Returns
         -------
@@ -365,12 +384,15 @@ class MoCAVIModel(MoCAVITrainingMixin, BaseModelClass):
         batch_size: Mini-batch size for data loading into model. Defaults to
             `scvi.settings.batch_size`.
         return_mean: Whether to return the mean of the samples.
+        disable_tqdm: Disable progress bar.
 
         Returns
         -------
-            A dictionary with keys "background" and "salient", with value as follows.
+            A dictionary containing two keys, 'background' and 'salient', each containing
+            a dictionary with keys 'exp', 'pro', and 'chr' for the corresponding modality.
+            This dictionary contains the normalized output values for that modality.
             If `n_samples` > 1 and `return_mean` is `False`, then the shape is
-            `(samples, cells, genes)`. Otherwise, shape is `(cells, genes)`.
+            `(samples, cells, features)`. Otherwise, shape is `(cells, features)`.
         """
         adata = self._validate_anndata(adata)
         if indices is None:
@@ -513,7 +535,7 @@ class MoCAVIModel(MoCAVITrainingMixin, BaseModelClass):
         disable_tqdm: bool | None = False,
     ):
         """
-        Return the normalized (decoded) gene output.
+        Return the normalized (decoded) feature output.
 
         Outputs are decoded from either the background or salient latent space.
         One of `output_type` or `indices_to_return_salient` should have an input
@@ -527,11 +549,6 @@ class MoCAVIModel(MoCAVITrainingMixin, BaseModelClass):
         transform_batch: Batch to condition on. If transform_batch is:
             - None, then real observed batch is used.
             - int, then batch transform_batch is used.
-        gene_list: Return frequencies of expression for a subset of genes. This can
-            save memory when working with large datasets and few genes are of interest.
-        library_size:  Scale the expression frequencies to a common library size. This
-            allows gene expression levels to be interpreted on a common scale of
-            relevant magnitude. If set to `"latent"`, use the latent library size.
         n_samples: Number of posterior samples to use for estimation.
         n_samples_overall: The number of random samples in `adata` to use.
         batch_size: Mini-batch size for data loading into model. Defaults to
@@ -544,6 +561,8 @@ class MoCAVIModel(MoCAVITrainingMixin, BaseModelClass):
             and salient latent embeddings are returned. If `indices` is not `None` and
             is not a subset of `indices_to_return_salient`, normalized expressions
             derived only from background latent embeddings are returned.
+        modality_key: One of ["exp", "pro", "chr"].
+        disable_tqdm: Disable progress bar.
 
         Returns
         -------
@@ -627,6 +646,7 @@ class MoCAVIModel(MoCAVITrainingMixin, BaseModelClass):
             overrides `group1` and `group2`.
         idx2: Custom identifier for `group2` that has the same properties as `idx1`.
             By default, includes all cells not specified in `idx1`.
+        modality_key: One of ["exp", "pro", "chr"].
         mode: Method for differential expression. See
             https://docs.scvi-tools.org/en/0.14.1/user_guide/background/differential_expression.html
             for more details.
@@ -655,7 +675,7 @@ class MoCAVIModel(MoCAVITrainingMixin, BaseModelClass):
             normalized expression values are used.
 
         **kwargs: Keyword args for
-            `scvi.model.base.DifferentialComputation.get_bayes_factors`.
+            `mocavi._differential.DifferentialComputation.get_bayes_factors`.
 
         Returns
         -------
@@ -738,7 +758,12 @@ class MoCAVIModel(MoCAVITrainingMixin, BaseModelClass):
         **kwargs,
     ) -> pd.DataFrame:
         r"""
-        Perform differential expression analysis.
+        Perform synthetic differential abundance analysis.
+
+        Note that these calculation is based on the synthetic data generated by the model, and is not
+        directly comparable to the fold-change values obtained from the real data. Notably, the model generates
+        counterfactual data, imputing what would happen if the cells were had the same background but zeroed out
+        salient variables.
 
         Args:
         ----
@@ -753,6 +778,7 @@ class MoCAVIModel(MoCAVITrainingMixin, BaseModelClass):
             it will query indices that verifies conditions on adata.obs, as described
             in `pandas.DataFrame.query()`. If `idx1` is not `None`, this option
             overrides `group1` and `group2`.
+        modality_key: One of ["exp", "pro", "chr"].
         mode: Method for differential expression. See
             https://docs.scvi-tools.org/en/0.14.1/user_guide/background/differential_expression.html
             for more details.
@@ -769,9 +795,10 @@ class MoCAVIModel(MoCAVITrainingMixin, BaseModelClass):
             `batch_correction` is `True`, and by default all categories are used.
         fdr_target: Tag features as DE based on posterior expected false discovery rate.
         silent: If `True`, disables the progress bar. Default: `False`.
+        n_samples: Number of posterior samples to use for estimation.
 
         **kwargs: Keyword args for
-            `scvi.model.base.DifferentialComputation.get_bayes_factors`.
+            `mocavi._differential.DifferentialComputation.get_bayes_factors`.
 
         Returns
         -------
@@ -852,8 +879,33 @@ class MoCAVIModel(MoCAVITrainingMixin, BaseModelClass):
         batch_size: int | None = None,
         n_samples: int = 100,
         library_rna: float = 1e4,
-        **kwargs,
+        library_acc: float = 1e4,
     ):
+        """
+        Get synthetic fold change for each label and each modality.
+
+        This typically is faster to compute than the full synthetic differential abundance (because it does not
+        require to compute statistical significance for differential abundance for each pair of labels).
+
+        Note that this fold-change calculation is based on the synthetic data generated by the model, and is not
+        directly comparable to the fold-change values obtained from the real data. Notably, the model generates
+        counterfactual data, imputing what would happen if the cells were had the same background but zeroed out
+        salient variables.
+
+        Args:
+        ----
+        labels: List of labels we are interested in for differential computations. If `None`, all labels are used.
+        batch_size: Mini-batch size for data loading into model. Defaults to
+            `scvi.settings.batch_size`.
+        n_samples: Number of posterior samples to use for estimation.
+        library_rna: Library size for scaling RNA measurements.
+        library_acc: Library size for scaling ATAC measurements
+
+        Returns
+        -------
+        A dictionary containing three keys, 'fold_change_exprs', 'fold_change_pros', and 'fold_change_chr',
+        each containing a dataframe with the fold change values for each label.
+        """
         self._validate_anndata(self.adata)
 
         if labels is None:
@@ -956,7 +1008,7 @@ class MoCAVIModel(MoCAVITrainingMixin, BaseModelClass):
             1 + library_rna * background_mean_exprs
         )
         fold_change_pros = np.log2(0.5 + salient_mean_pros) - np.log2(0.5 + background_mean_pros)
-        fold_change_chr = np.log2(1 + library_rna * salient_mean_chr) - np.log2(1 + library_rna * background_mean_chr)
+        fold_change_chr = np.log2(1 + library_acc * salient_mean_chr) - np.log2(1 + library_acc * background_mean_chr)
 
         # put in a dataframe
         fold_change_exprs = pd.DataFrame(

@@ -34,7 +34,7 @@ def adt_raw_counts_properties(
     Parameters
     ----------
     adata_manager
-        :class:`~scvi.data.AnnDataManager` object setup with :class:`~scvi.model.TOTALVI`.
+        :class:`~scvi.data.AnnDataManager` object setup with :class:`~mocavi.MoCAVIModel`.
     idx1
         subset of indices describing the first population.
     idx2
@@ -47,8 +47,6 @@ def adt_raw_counts_properties(
         mean expression per gene, proportion of non-zero expression per gene, mean of normalized
         expression.
     """
-    protein_exp = adata_manager.get_from_registry(REGISTRY_KEYS.PROTEIN_EXP_KEY)
-
     nan = np.array([np.nan] * adata_manager.summary_stats.n_proteins)
     protein_exp = adata_manager.get_from_registry(REGISTRY_KEYS.PROTEIN_EXP_KEY)
     mean1_pro = np.asarray(protein_exp[idx1].mean(0))
@@ -250,7 +248,7 @@ class DifferentialComputation:
     model_fn
         Function in model API to get values from.
     adata_manager
-        AnnDataManager created by :meth:`~scvi.model.SCVI.setup_anndata`.
+        AnnDataManager created by :meth:`~mocavi.MoCAVIModel.setup_anndata`.
     """
 
     def __init__(self, model_fn, adata_manager):
