@@ -7,7 +7,28 @@
 [link-tests]: https://github.com/romain-lopez/mocavi/actions/workflows/test.yml
 [badge-docs]: https://img.shields.io/readthedocs/mocavi
 
-Multi-EnModal Multi-Environment Contrastive Analysis using Variational Inference
+## Multi-modal Contrastive Analysis of Perturbation Data
+
+This package introduces MoCAVI (Multi-modal Contrastive Analysis via Variational Inference), a python package for analyzing multi-modal single-cell perturbation data, integrating information across genes, proteins, and chromatin accessibility. MoCAVI is implemented using scvi-tools.
+
+# Background:
+
+Current single-cell technologies enable the simultaneous measurement of multiple modalities, such as gene expression, protein levels, and chromatin accessibility. However, analyzing perturbation effects in these multi-modal datasets presents unique challenges. The effect size of perturbations on molecular profiles is often smaller than the inherent heterogeneity in the initial cell population, limiting the power of traditional analysis methods.
+We present MoCAVI, a novel probabilistic method for multi-modal analysis of single-cell perturbation data that explicitly models both background cellular heterogeneity and perturbation-induced changes. MoCAVI builds upon the framework of contrastive analysis to isolate perturbation effects in a separate latent space from the background heterogeneity, demonstrating higher sensitivity in handling various modalities.
+
+## Key Features of MoCAVI
+
+1. **Multi-modal Integration:** MoCAVI can handle any subset of modalities including gene expression, protein measurements, and chromatin accessibility.
+
+2. **Dual Latent Spaces:** As previous methods performing Contrastive Analysis, MoCAVI produces two distinct latent spaces - a background space capturing control population heterogeneity, and a salient space isolating perturbation effects.
+
+3. **Environment-specific Modeling:** MoCAVI partitions the dataset into multiple environments, including a baseline (control) environment and separate environments for each perturbation.
+
+4. **Flexible Probability Distributions:** The model employs appropriate probability distributions for each modality (e.g., negative binomial for gene expression, mixture of negative binomial for protein measurements).
+
+5. **Amortized Variational Inference:** MoCAVI is fitted using amortized variational inference with modality-specific encoder networks.
+
+By applying MoCAVI, researchers can gain deeper insights into perturbation effects across multiple molecular layers, while accounting for background cellular heterogeneity. The attached tutorial will guide you through the process of using MoCAVI to analyze your multi-modal single-cell perturbation data.
 
 ## Getting started
 
@@ -20,21 +41,20 @@ Please refer to the [documentation][link-docs]. In particular, the
 You need to have Python 3.10 or newer installed on your system. If you don't have
 Python installed, we recommend installing [Mambaforge](https://github.com/conda-forge/miniforge#mambaforge).
 
-There are several alternative options to install mocavi:
-
-<!--
-1) Install the latest release of `mocavi` from [PyPI][link-pypi]:
+1. Create a new conda env
 
 ```bash
-pip install mocavi
+conda create -n mocavi python=3.10
 ```
--->
 
-1. Install the latest development version:
+2. Clone the repo and move into the folder
+3. Install in editable mode
 
 ```bash
-pip install git+https://github.com/romain-lopez/mocavi.git@main
+pip install -e .
 ```
+
+4. Install additional dependencies (e.g., scanpy etc..)
 
 ## Release notes
 

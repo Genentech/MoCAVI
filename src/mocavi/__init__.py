@@ -1,7 +1,8 @@
 from importlib.metadata import version
 
-from . import pl, pp, tl
+from ._model import MoCAVIModel
+from ._module import MoCAVIModule
 
-__all__ = ["pl", "pp", "tl"]
+__all__ = ["MoCAVIModel", "MoCAVIModule"]
 
 __version__ = version("mocavi")

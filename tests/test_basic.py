@@ -1,10 +1,16 @@
 import pytest
+import scvi
 
 import mocavi
 
 
 def test_package_has_version():
     assert mocavi.__version__ is not None
+
+
+def test_scvi_create_model():
+    model = scvi.model.SCVI()
+    assert model is not None
 
 
 @pytest.mark.skip(reason="This decorator should be removed when test passes.")

@@ -20,6 +20,7 @@ urls.Source = "https://github.com/romain-lopez/mocavi"
 urls.Home-page = "https://github.com/romain-lopez/mocavi"
 dependencies = [
     "anndata",
+    "scvi-tools==1.1.5",
     # for debug logging (referenced from the issue template)
     "session-info",
 ]
@@ -33,7 +34,6 @@ doc = [
     "docutils>=0.8,!=0.18.*,!=0.19.*",
     "sphinx>=4",
     "sphinx-book-theme>=1.0.0",
-    "scvi-tools=1.1.5",
     "myst-nb>=1.1.0",
     "sphinxcontrib-bibtex>=1.0.0",
     "setuptools",  # Until pybtex >0.23.0 releases: https://bitbucket.org/pybtex-devs/pybtex/issues/169/
