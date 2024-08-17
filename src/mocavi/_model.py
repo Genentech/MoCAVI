@@ -1029,7 +1029,7 @@ class MoCAVIModel(MoCAVITrainingMixin, BaseModelClass):
 
         # return in a dictionary
         return {
-            "fold_change_exprs": fold_change_exprs,
-            "fold_change_pros": fold_change_pros,
+            "fold_change_exp": fold_change_exprs,
+            "fold_change_pro": fold_change_pros,
             "fold_change_chr": fold_change_chr,
         }

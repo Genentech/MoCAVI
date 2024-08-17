@@ -181,3 +181,9 @@ class TestMoCAVI:
         )
         assert isinstance(de_df, pd.DataFrame)
         assert de_df.shape[0] == n_features
+
+    def test_synthetic_fold_change(self, mock_mocavi_model):
+        de_df = mock_mocavi_model.get_label_synthetic_fold_change()["fold_change_exp"]
+
+        assert isinstance(de_df, pd.DataFrame)
+        assert de_df.shape[1] == mock_mocavi_model.n_genes
