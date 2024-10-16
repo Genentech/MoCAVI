@@ -11,6 +11,7 @@ import torch
 from scvi import REGISTRY_KEYS, settings
 from scvi._types import Number
 from scvi.data import AnnDataManager
+from scvi.model.base._de_core import _fdr_de_prediction, _prepare_obs
 from scvi.model.base._differential import (
     densify,
     describe_continuous_distrib,
@@ -18,7 +19,6 @@ from scvi.model.base._differential import (
     estimate_pseudocounts_offset,
     pairs_sampler,
 )
-from scvi.model.base._utils import _fdr_de_prediction, _prepare_obs
 from scvi.utils import track
 
 logger = logging.getLogger(__name__)
