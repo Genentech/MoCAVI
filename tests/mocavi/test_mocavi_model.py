@@ -66,7 +66,7 @@ class TestMoCAVI:
             max_epochs=1,
             batch_size=40,  # Unequal final batches to test edge cases.
             plan_kwargs={
-                "lr": 0.0001,
+                "lr": 0.000001,
             },
         )
 
