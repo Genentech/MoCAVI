@@ -64,7 +64,7 @@ class TestMoCAVI:
             background_indices=mock_background_indices,
             target_indices=mock_target_indices,
             max_epochs=1,
-            batch_size=40,  # Unequal final batches to test edge cases.
+            batch_size=400,  # Unequal final batches to test edge cases.
             plan_kwargs={
                 "lr": 0.000001,
             },

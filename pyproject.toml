@@ -15,9 +15,8 @@ authors = [
 maintainers = [
     {name = "Romain Lopez", email = "lopezr55@gene.com"},
 ]
-urls.Documentation = "https://mocavi.readthedocs.io/"
-urls.Source = "https://github.com/romain-lopez/mocavi"
-urls.Home-page = "https://github.com/romain-lopez/mocavi"
+urls.Source = "https://github.com/Genentech/MoCAVI"
+urls.Home-page = "https://github.com/Genentech/MoCAVI"
 dependencies = [
     "anndata",
     "scvi-tools==1.3.0",

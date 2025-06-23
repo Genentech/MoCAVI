@@ -806,6 +806,12 @@ class MoCAVIModel(MoCAVITrainingMixin, BaseModelClass):
         """
         adata = self._validate_anndata(adata)
 
+        # check that all groups in group1 have at least one cell
+        for group in group1:
+            n_cells_in_group = np.sum(adata.obs[groupby] == group)
+            if n_cells_in_group == 0:
+                raise ValueError(f"Group '{group}' in 'group1' has no cells in the AnnData object.")
+
         model_fn1 = partial(
             self.get_specific_normalized_outputs,
             n_samples=n_samples,

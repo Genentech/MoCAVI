@@ -3,9 +3,8 @@
 [![Tests][badge-tests]][link-tests]
 [![Documentation][badge-docs]][link-docs]
 
-[badge-tests]: https://img.shields.io/github/actions/workflow/status/romain-lopez/mocavi/test.yaml?branch=main
-[link-tests]: https://github.com/romain-lopez/mocavi/actions/workflows/test.yml
-[badge-docs]: https://img.shields.io/readthedocs/mocavi
+[badge-tests]: https://img.shields.io/github/actions/workflow/status/Genentech/MoCAVI/test.yaml?branch=main
+[link-tests]: https://github.com/Genentech/MoCAVI/actions/workflows/test.yml
 
 ## Multi-modal Contrastive Analysis of Perturbation Data
 
@@ -30,16 +29,10 @@ We present MoCAVI, a novel probabilistic method for multi-modal analysis of sing
 
 By applying MoCAVI, researchers can gain deeper insights into perturbation effects across multiple molecular layers, while accounting for background cellular heterogeneity. The attached tutorial will guide you through the process of using MoCAVI to analyze your multi-modal single-cell perturbation data.
 
-## Getting started
-
-Please refer to the [documentation][link-docs]. In particular, the
-
--   [API documentation][link-api].
-
 ## Installation
 
 You need to have Python 3.10 or newer installed on your system. If you don't have
-Python installed, we recommend installing [Mambaforge](https://github.com/conda-forge/miniforge#mambaforge).
+Python installed, we recommend installing miniforge, which is a minimal conda installer.
 
 1. Create a new conda env
 
@@ -48,17 +41,31 @@ conda create -n mocavi python=3.10
 ```
 
 2. Clone the repo and move into the folder
+
+```bash
+git clone https://www.github.com/Genentech/MoCAVI.git
+cd MoCAVI
+```
+
 3. Install in editable mode
 
 ```bash
-pip install -e .
+pip install .
 ```
 
-4. Install additional dependencies (e.g., scanpy etc..)
+5. Install the dependencies for the tutorial
 
-## Release notes
+```bash
+pip install scanpy
+```
 
-See the [changelog][changelog].
+5. Download the data used in the tutorial
+
+```bash
+mkdir data && cd data
+wget "https://figshare.com/ndownloader/files/55582163?private_link=49ffd57d7316562c54aa" -O human_icCITE_seq_filtered.h5ad
+cd ..
+```
 
 ## Contact
 
@@ -70,8 +77,4 @@ If you found a bug, please use the [issue tracker][issue-tracker].
 > t.b.a
 
 [scverse-discourse]: https://discourse.scverse.org/
-[issue-tracker]: https://github.com/romain-lopez/mocavi/issues
-[changelog]: https://mocavi.readthedocs.io/latest/changelog.html
-[link-docs]: https://mocavi.readthedocs.io
-[link-api]: https://mocavi.readthedocs.io/latest/api.html
-[link-pypi]: https://pypi.org/project/mocavi
+[issue-tracker]: https://github.com/Genentech/MoCAVI/issues
