@@ -33,8 +33,8 @@ By applying MoCAVI, researchers can gain deeper insights into perturbation effec
 
 You first need to clone the repository from GitHub:
 
-```
-git clone [https://github.com/Genentech/MoCAVI.git](https://github.com/Genentech/MoCAVI.git)
+```bash
+git clone https://github.com/Genentech/MoCAVI.git
 ```
 
 
