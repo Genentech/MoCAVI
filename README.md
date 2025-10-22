@@ -34,16 +34,110 @@ By applying MoCAVI, researchers can gain deeper insights into perturbation effec
 You need to have Python 3.10 or newer installed on your system. If you don't have
 Python installed, we recommend installing miniforge, which is a minimal conda installer.
 
+You first need to clone the repository from GitHub:
+```bash
+git clone [https://github.com/Genentech/MoCAVI.git](https://github.com/Genentech/MoCAVI.git)
+```
+
+### Installation using `pixi`
+
+#### 1\. Install `pixi`
+
+If you don't already have `pixi` installed, use the following command to install it:
+
+```bash
+curl -fsSL [https://pixi.sh/install.sh](https://pixi.sh/install.sh) | sh
+```
+
+Restart your terminal after the installation for the `pixi` command to be available in your system's PATH.
+
+#### 2\. Set Up the Project Environment
+
+First, define an environment variable pointing to the location of your local `MoCAVI` repository. *Make sure to change the path in the command below* to match the location on your system.
+
+```bash
+# !! IMPORTANT: Change this path to the root directory of your local MoCAVI clone
+export mocavi_path="~/tools/MoCAVI"
+```
+
+Next, navigate to the directory where you want to store your environment files and initialize the `pixi` project:
+
+```bash
+# We recommend creating a dedicated directory (e.g., ~/scratch/pixi/)
+mkdir -p ~/scratch/pixi/
+cd ~/scratch/pixi/
+
+# Initialize the new environment 
+pixi init mocavi
+            
+# Enter the newly created project directory
+cd mocavi
+```
+
+You will run all subsequent commands from within this `mocavi` directory.
+
+#### 3\. Add Dependencies
+
+We will now add the required packages to the project. `pixi` will automatically manage and resolve the dependencies.
+
+1.  **Add Python:**
+
+    ```bash
+    pixi add python=3.10
+    ```
+
+2.  **Add MoCAVI:**
+    This command installs `MoCAVI` from your local path in "editable" mode (`--editable`). This means any changes you make to the `MoCAVI` source code will be immediately reflected in your environment.
+
+    ```bash
+    pixi add --pypi "MoCAVI @ file://$(realpath ${mocavi_path})" --editable
+    ```
+
+3.  **Add Tutorial & Notebook Dependencies:**
+    Install `seaborn`, `scanpy`, and `ipykernel` (which is required to use this environment in Jupyter).
+
+    ```bash
+    pixi add seaborn scanpy ipykernel
+    ```
+
+#### 4\. Install and Activate the Environment
+
+Run `pixi install` to ensure all packages are correctly installed based on the lock file.
+
+```bash
+pixi install
+```
+
+To activate and enter the environment, run:
+
+```bash
+pixi shell
+```
+
+Your terminal prompt should now change, indicating you are inside the active `mocavi` environment.
+
+#### 5\. (Optional) Register for Jupyter Notebook
+
+If you plan to use this environment in Jupyter Lab or Jupyter Notebook, run the following command while the environment is active (i.e., after running `pixi shell`):
+
+```bash
+python -m ipykernel install --user --name mocavi --display-name "MoCAVI Environment (mocavi)"
+```
+
+This makes the `"MoCAVI Environment (mocavi)"` kernel available in your Jupyter interface, allowing you to easily select it when running notebooks.
+
+
+### Installation with `conda`
+
 1. Create a new conda env
 
 ```bash
 conda create -n mocavi python=3.10
 ```
 
-2. Clone the repo and move into the folder
+2. Move into the folder where the repository was cloned
 
 ```bash
-git clone https://www.github.com/Genentech/MoCAVI.git
 cd MoCAVI
 ```
 
