@@ -37,6 +37,12 @@ You first need to clone the repository from GitHub:
 git clone https://github.com/Genentech/MoCAVI.git
 ```
 
+Define an environment variable pointing to the location of your local `MoCAVI` repository.
+
+```bash
+# Change the path in the command below to match the location on your system
+export mocavi_path="~/tools/MoCAVI"
+```
 
 You need to have Python 3.10 or newer installed on your system. If you don't have
 Python installed, we recommend installing miniforge, which is a minimal conda installer.
@@ -56,14 +62,7 @@ Restart your terminal after the installation for the `pixi` command to be availa
 
 #### 2\. Set Up the Project Environment
 
-First, define an environment variable pointing to the location of your local `MoCAVI` repository. *Make sure to change the path in the command below* to match the location on your system.
-
-```bash
-# !! IMPORTANT: Change this path to the root directory of your local MoCAVI clone
-export mocavi_path="~/tools/MoCAVI"
-```
-
-Next, navigate to the directory where you want to store your environment files and initialize the `pixi` project:
+Navigate to the directory where you want to store your environment files and initialize the `pixi` project:
 
 ```bash
 # We recommend creating a dedicated directory (e.g., ~/scratch/pixi/)
@@ -132,7 +131,7 @@ conda activate mocavi
 2. Move into the folder where the repository was cloned
 
 ```bash
-cd MoCAVI
+cd $mocavi_path
 ```
 
 3. Install in editable mode
