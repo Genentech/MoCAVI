@@ -94,7 +94,7 @@ We will now add the required packages to the project. `pixi` will automatically 
     ```
 
 3.  **Add Tutorial & Notebook Dependencies:**
-    Install `seaborn`, `scanpy`, and `ipykernel` (which is required to use this environment in Jupyter).
+    Install `seaborn`, `scanpy`, and also `ipykernel` if you want to use this environment in Jupyter.
 
     ```bash
     pixi add seaborn scanpy ipykernel
@@ -116,23 +116,14 @@ pixi shell
 
 Your terminal prompt should now change, indicating you are inside the active `mocavi` environment.
 
-#### 5\. (Optional) Register for Jupyter Notebook
 
-If you plan to use this environment in Jupyter Lab or Jupyter Notebook, run the following command while the environment is active (i.e., after running `pixi shell`):
+### Installation with `conda` and `pip`
 
-```bash
-python -m ipykernel install --user --name mocavi --display-name "MoCAVI Environment (mocavi)"
-```
-
-This makes the `"MoCAVI Environment (mocavi)"` kernel available in your Jupyter interface, allowing you to easily select it when running notebooks.
-
-
-### Installation with `conda`
-
-1. Create a new conda env
+1. Create a new conda environment and activate the  environment
 
 ```bash
 conda create -n mocavi python=3.10
+conda activate mocavi
 ```
 
 2. Move into the folder where the repository was cloned
@@ -150,10 +141,21 @@ pip install .
 5. Install the dependencies for the tutorial
 
 ```bash
-pip install scanpy
+pip install seaborn scanpy 
 ```
 
-5. Download the data used in the tutorial
+### (Optional) Register the MoCAVI environment for Jupyter Notebook
+
+If you plan to use this environment in Jupyter Lab or Jupyter Notebook, run the following command while the environment is active (i.e., after running `pixi shell` or `conda activate mocavi`):
+
+```bash
+python -m ipykernel install --user --name mocavi --display-name "MoCAVI Environment (mocavi)"
+```
+
+This makes the `"MoCAVI Environment (mocavi)"` kernel available in your Jupyter interface, allowing you to easily select it when running notebooks.
+
+
+### Download the data used in the tutorial
 
 ```bash
 mkdir data && cd data
