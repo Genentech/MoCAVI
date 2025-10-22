@@ -31,13 +31,16 @@ By applying MoCAVI, researchers can gain deeper insights into perturbation effec
 
 ## Installation
 
+You first need to clone the repository from GitHub:
+
+```
+git clone [https://github.com/Genentech/MoCAVI.git](https://github.com/Genentech/MoCAVI.git)
+```
+
+
 You need to have Python 3.10 or newer installed on your system. If you don't have
 Python installed, we recommend installing miniforge, which is a minimal conda installer.
 
-You first need to clone the repository from GitHub:
-```bash
-git clone [https://github.com/Genentech/MoCAVI.git](https://github.com/Genentech/MoCAVI.git)
-```
 
 ### Installation using `pixi`
 
