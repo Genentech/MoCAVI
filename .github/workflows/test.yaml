@@ -41,6 +41,13 @@ jobs:
           cache: "pip"
           cache-dependency-path: "**/pyproject.toml"
 
+      # custom step for freeing up disk space on ubuntu-latest runners
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          docker image prune -a -f
+          sudo apt-get clean
+
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip wheel
