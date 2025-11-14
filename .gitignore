@@ -2,7 +2,7 @@
 .DS_Store
 *~
 buck-out/
-entry_points/data/
+demos/data/
 
 # Compiled files
 .venv/

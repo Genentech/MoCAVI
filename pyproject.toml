@@ -13,7 +13,7 @@ authors = [
     {name = "Romain Lopez"},
 ]
 maintainers = [
-    {name = "Romain Lopez", email = "lopezr55@gene.com"},
+    {name = "Romain Lopez", email = "romain.lopez@nyu.edu"},
 ]
 urls.Source = "https://github.com/Genentech/MoCAVI"
 urls.Home-page = "https://github.com/Genentech/MoCAVI"
