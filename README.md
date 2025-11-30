@@ -9,6 +9,8 @@
 
 This package introduces MoCAVI (Multi-modal Contrastive Analysis via Variational Inference), a python package for analyzing multi-modal single-cell perturbation data, integrating information across genes, proteins, and chromatin accessibility. MoCAVI is implemented using scvi-tools.
 
+We also include EB-MoCAVI, an extension of MoCAVI that enables embedding-based modeling of unseen perturbations using empirical Bayes. We demonstrate the application of EB-MoCAVI on a multi-modal single-cell perturbation dataset with paired gene expression and optical pooled screening (OPS) measurements.
+
 ### Background:
 
 Current single-cell technologies enable the simultaneous measurement of multiple modalities, such as gene expression, protein levels, and chromatin accessibility. However, analyzing perturbation effects in these multi-modal datasets presents unique challenges. The effect size of perturbations on molecular profiles is often smaller than the inherent heterogeneity in the initial cell population, limiting the power of traditional analysis methods.
@@ -27,6 +29,10 @@ We present MoCAVI, a novel probabilistic method for multi-modal analysis of sing
 5. **Amortized Variational Inference:** MoCAVI is fitted using amortized variational inference with modality-specific encoder networks.
 
 By applying MoCAVI, researchers can gain deeper insights into perturbation effects across multiple molecular layers, while accounting for background cellular heterogeneity. The attached tutorial will guide you through the process of using MoCAVI to analyze your multi-modal single-cell perturbation data.
+
+### Additional Features of EB-MoCAVI
+
+EB-MoCAVI extends MoCAVI by enabling the modeling of unseen perturbations using empirical Bayes. By leveraging embeddings from an auxiliary assay (e.g., OPS), EB-MoCAVI can predict perturbation effects for perturbations not present in the training data.
 
 ### Installation
 
@@ -54,22 +60,18 @@ pip install .
 pip install scanpy seaborn
 ```
 
-4. Download the data used in the tutorial
-
-```bash
-mkdir data && cd data
-curl -L -A "Mozilla/5.0" -o human_icCITE_seq_filtered.h5ad "https://figshare.com/ndownloader/files/55582163?private_link=49ffd57d7316562c54aa"
-cd ..
-```
-
-If the curl command does not work, please download the file manually from the link using a web browser.
-
 ### Contact
 
 For questions and help requests, you can reach out in the [scverse discourse][scverse-discourse].
 If you found a bug, please use the [issue tracker][issue-tracker].
 
 ### Citation
+
+MoCAVI
+
+> t.b.a
+
+EB-MoCAVI
 
 > t.b.a
 
