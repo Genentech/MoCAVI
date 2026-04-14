@@ -14,6 +14,7 @@ from scvi.data.fields import (
     MuDataNumericalJointObsField,
     MuDataProteinLayerField,
     NumericalJointObsField,
+    ObsmField,
     ProteinObsmField,
 )
 from scvi.model import SCVI
@@ -40,6 +41,7 @@ def generic_setup_adata_manager(
     layer: str | None = None,
     protein_expression_obsm_key: str | None = None,
     protein_names_uns_key: str | None = None,
+    embeddings_obsm_key: str | None = None,
 ) -> AnnDataManager:
     setup_args = locals()
     setup_args.pop("adata")
@@ -62,6 +64,13 @@ def generic_setup_adata_manager(
                 batch_field=batch_field,
                 colnames_uns_key=protein_names_uns_key,
                 is_count_data=True,
+            )
+        )
+    if embeddings_obsm_key is not None:
+        anndata_fields.append(
+            ObsmField(
+                "emp_prior",
+                embeddings_obsm_key,
             )
         )
     adata_manager = AnnDataManager(fields=anndata_fields, setup_method_args=setup_method_args)

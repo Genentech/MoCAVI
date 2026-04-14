@@ -139,6 +139,46 @@ def mock_target_indices(mock_mocavi_adata):
     return adata.obs.index[(adata.obs["batch"] == "batch_1")].astype(int).tolist()
 
 
+@pytest.fixture(scope="session")
+def mock_ebmocavi_adata():
+    """Synthetic ebmocavi adata."""
+    adata = scvi.data.synthetic_iid(n_batches=2)
+    adata = adata[:-3, :]  # Unequal technical batch sizes.
+    adata.layers["raw_counts"] = adata.X.copy()
+    # add embeddings for imputation
+    adata.obsm["embeddings"] = adata.X[:, :10]
+    # replace label "label_0" with "Control"
+    adata.obs["labels"].replace({"label_0": "Control"}, inplace=True)
+    return adata
+
+
+@pytest.fixture(scope="session")
+def mock_ebmocavi_adata_manager(mock_ebmocavi_adata):
+    """Anndata manager for synthetic mocavi data."""
+    return generic_setup_adata_manager(
+        adata=mock_ebmocavi_adata,
+        batch_key="batch",
+        labels_key="labels",
+        layer="raw_counts",
+        protein_expression_obsm_key="protein_expression",
+        embeddings_obsm_key="embeddings",
+    )
+
+
+@pytest.fixture(scope="session")
+def mock_ebmocavi_background_indices(mock_ebmocavi_adata):
+    """Indices for background data in ``mock_ebmocavi_adata_manager``."""
+    adata = mock_ebmocavi_adata
+    return adata.obs.index[(adata.obs["batch"] == "batch_0")].astype(int).tolist()
+
+
+@pytest.fixture(scope="session")
+def mock_ebmocavi_target_indices(mock_ebmocavi_adata):
+    """Indices for target data in ``mock_ebmocavi_adata_manager``."""
+    adata = mock_ebmocavi_adata
+    return adata.obs.index[(adata.obs["batch"] == "batch_1")].astype(int).tolist()
+
+
 @pytest.fixture(autouse=True)
 def set_seed(request):
     """Sets the seed for each test."""

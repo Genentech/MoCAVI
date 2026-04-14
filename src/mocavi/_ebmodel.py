@@ -1,0 +1,2129 @@
+"""Model class for MoCAVI for single cell multi-omics data."""
+
+import logging
+from collections.abc import Iterable, Sequence
+from functools import partial
+from typing import Literal
+
+import numpy as np
+import pandas as pd
+import torch
+from anndata import AnnData
+from scvi import REGISTRY_KEYS
+from scvi._types import Number
+from scvi.data import AnnDataManager
+from scvi.data._constants import _SCVI_UUID_KEY
+from scvi.data._utils import _assign_adata_uuid, _check_if_view
+from scvi.data.fields import (
+    CategoricalJointObsField,
+    CategoricalObsField,
+    LayerField,
+    NumericalJointObsField,
+    ObsmField,
+    ProteinObsmField,
+)
+from scvi.dataloaders import AnnDataLoader
+from scvi.model._utils import (
+    _get_batch_code_from_category,
+    scrna_raw_counts_properties,
+)
+from scvi.model.base import BaseModelClass
+from scvi.utils import setup_anndata_dsp
+from torch.distributions import Normal
+from tqdm import tqdm
+
+from ._differential import _de_core, _de_paired_test_core, adt_raw_counts_properties
+from ._ebmodule import EBMoCAVIModule
+from ._training_mixin import MoCAVITrainingMixin
+
+logger = logging.getLogger(__name__)
+
+
+class EBMoCAVIModel(MoCAVITrainingMixin, BaseModelClass):
+    """
+    Model class for MoCAVI.
+
+    Args:
+    ----
+        adata : AnnData
+        AnnData object that has been registered via `MoCAVIModel.setup_anndata`.
+        n_genes : int
+            Number of genes in the dataset.
+        n_regions : int
+            Number of genomic regions (for ATAC-seq data).
+        n_batch : int, optional
+            Number of batches. If 0, no batch effect correction is performed (default is 0).
+        n_hidden : int, optional
+            Number of nodes per hidden layer (default is 128).
+        n_background_latent : int
+            Dimensionality of the background latent space (default is 10).
+        n_salient_latent : int
+            Dimensionality of the salient latent space (default is 10).
+        n_layers_encoder : int
+            Number of hidden layers used for encoder neural networks (default is 1).
+        n_layers_decoder : int
+            Number of hidden layers used for decoder neural networks (default is 1).
+        dropout_rate : float
+            Dropout rate for neural networks (default is 0.1).
+        reweighting_mode : str, optional
+            Mode for reweighting. Options are "bt" (batch-target) or "auto" (default is "auto").
+        wasserstein_reg : float, optional
+            Strenght parameter for Wasserstein regularization (default is 0).
+    """
+
+    def __init__(
+        self,
+        adata: AnnData,
+        n_genes: int,
+        n_regions: int,
+        n_batch: int = 0,
+        n_hidden: int = 128,
+        n_background_latent: int = 10,
+        n_salient_latent: int = 10,
+        n_layers_encoder: int = 1,
+        n_layers_decoder: int = 1,
+        dropout_rate: float = 0.1,
+        reweighting_mode: str = "auto",
+        wasserstein_reg: float = 0,
+    ) -> None:
+        super().__init__(adata)
+        self.reweighting_mode = reweighting_mode
+
+        n_cats_per_cov = (
+            self.adata_manager.get_state_registry(REGISTRY_KEYS.CAT_COVS_KEY).n_cats_per_key
+            if REGISTRY_KEYS.CAT_COVS_KEY in self.adata_manager.data_registry
+            else None
+        )
+        # overload summary stats
+        self.n_genes = n_genes
+        self.n_regions = n_regions
+        n_proteins = self.summary_stats.get("n_proteins", 0)
+        self.n_proteins = n_proteins
+        n_batch = self.summary_stats.n_batch
+
+        # key for embedding
+        n_input_embedding = self.adata_manager.summary_stats.n_emp_prior
+        n_labels = self.summary_stats.get("n_labels", 0)
+
+        # create module
+        self.module = EBMoCAVIModule(
+            n_input_genes=n_genes,
+            n_input_regions=n_regions,
+            n_input_proteins=n_proteins,
+            n_input_embedding=n_input_embedding,
+            n_cats_per_cov=n_cats_per_cov,
+            n_batch=n_batch,
+            n_labels=n_labels,
+            n_hidden=n_hidden,
+            n_background_latent=n_background_latent,
+            n_salient_latent=n_salient_latent,
+            n_layers_encoder=n_layers_encoder,
+            n_layers_decoder=n_layers_decoder,
+            dropout_rate=dropout_rate,
+            wasserstein_reg=wasserstein_reg,
+        )
+
+        self._model_summary_string = "MoCAVI Model with the following params:\n"
+        self._model_summary_string += f"n_genes: {n_genes}\n"
+        self._model_summary_string += f"n_regions: {n_regions}\n"
+        self._model_summary_string += f"n_proteins: {n_proteins}\n"
+        self._model_summary_string += f"n_batch: {n_batch}\n"
+        self._model_summary_string += f"n_hidden: {n_hidden}\n"
+        self._model_summary_string += f"n_input_embedding: {n_input_embedding}\n"
+        self._model_summary_string += f"n_background_latent: {n_background_latent}\n"
+        self._model_summary_string += f"n_salient_latent: {n_salient_latent}\n"
+        self._model_summary_string += f"n_layers_encoder: {n_layers_encoder}\n"
+        self._model_summary_string += f"n_layers_decoder: {n_layers_decoder}\n"
+        self._model_summary_string += f"dropout_rate: {dropout_rate}\n"
+        self._model_summary_string += f"reweighting_mode: {reweighting_mode}\n"
+
+        # Necessary line to get params to be used for saving and loading.
+        self.init_params_ = self._get_init_params(locals())
+        logger.info("The model has been initialized")
+
+    @classmethod
+    @setup_anndata_dsp.dedent
+    def setup_anndata(
+        cls,
+        adata: AnnData,
+        protein_expression_obsm_key: str,
+        protein_names_uns_key: str | None = None,
+        layer: str | None = None,
+        batch_key: str | None = None,
+        labels_key: str | None = None,
+        empirical_prior_key: str | None = None,
+        categorical_covariate_keys: list[str] | None = None,
+        continuous_covariate_keys: list[str] | None = None,
+        **kwargs,
+    ) -> AnnData | None:
+        """
+        Set up AnnData instance for EBMoCAVI model.
+
+        Args:
+        ----
+            adata: AnnData object containing raw counts. Rows represent cells, columns
+                represent features.
+            protein_expression_obsm_key: Key in `adata.obsm` where protein expression data is stored.
+            protein_names_uns_key: Key in `adata.uns` where protein names are stored.
+                If None, protein names are inferred from the protein expression data (default is None).
+            layer: If not None, uses this as the key in adata.layers for raw count data.
+            batch_key: Key in `adata.obs` for batch information. Categories will
+                automatically be converted into integer categories and saved to
+                `adata.obs["_scvi_batch"]`. If None, assign the same batch to all the
+                data.
+            labels_key: Key in `adata.obs` for label information. Categories will
+                automatically be converted into integer categories and saved to
+                `adata.obs["_scvi_labels"]`. If None, assign the same label to all the
+                data.
+            categorical_covariate_keys: Keys in `adata.obs` corresponding to categorical
+                data. Used in some models.
+            continuous_covariate_keys: Keys in `adata.obs` corresponding to continuous
+                data. Used in some models.
+
+        Returns
+        -------
+            If `copy` is True, return the modified `adata` set up for MoCAVI
+            model, otherwise `adata` is modified in place.
+        """
+        setup_method_args = cls._get_setup_method_args(**locals())
+        batch_field = CategoricalObsField(REGISTRY_KEYS.BATCH_KEY, batch_key)
+        emp_prior_field = ObsmField(
+            "emp_prior",
+            empirical_prior_key,
+        )
+        anndata_fields = [
+            LayerField(REGISTRY_KEYS.X_KEY, layer, is_count_data=True),
+            batch_field,
+            CategoricalObsField(REGISTRY_KEYS.LABELS_KEY, labels_key),
+            ProteinObsmField(
+                REGISTRY_KEYS.PROTEIN_EXP_KEY,
+                protein_expression_obsm_key,
+                use_batch_mask=True,
+                batch_field=batch_field,
+                colnames_uns_key=protein_names_uns_key,
+                is_count_data=True,
+            ),
+            CategoricalJointObsField(REGISTRY_KEYS.CAT_COVS_KEY, categorical_covariate_keys),
+            NumericalJointObsField(REGISTRY_KEYS.CONT_COVS_KEY, continuous_covariate_keys),
+            emp_prior_field,
+        ]
+        adata_manager = AnnDataManager(fields=anndata_fields, setup_method_args=setup_method_args)
+        adata_manager.register_fields(adata, **kwargs)
+        cls.register_manager(adata_manager)
+
+    def _validate_anndata(
+        self, adata: AnnData | None = None, copy_if_view: bool = True, auto_extend: bool = True
+    ) -> AnnData:
+        """Validate anndata has been properly registered, transfer if necessary."""
+        if adata is None:
+            adata = self.adata
+
+        _check_if_view(adata, copy_if_view=copy_if_view)
+
+        adata_manager = self.get_anndata_manager(adata)
+        if adata_manager is None:
+            logger.info("Input AnnData not setup with scvi-tools. " + "attempting to transfer AnnData setup")
+            self._register_manager_for_instance(
+                self.adata_manager.transfer_fields(adata, extend_categories=auto_extend)
+            )
+        else:
+            # Case where correct AnnDataManager is found, replay registration as necessary.
+            adata_manager.validate()
+
+        return adata
+
+    def get_anndata_manager(
+        self, adata: AnnData, required: bool = False, auto_extend: bool = True
+    ) -> AnnDataManager | None:
+        """Retrieves the :class:`~scvi.data.AnnDataManager` for a given AnnData object.
+
+        Requires ``self.id`` has been set. Checks for an :class:`~scvi.data.AnnDataManager`
+        specific to this model instance.
+
+        Parameters
+        ----------
+        adata
+            AnnData object to find manager instance for.
+        required
+            If True, errors on missing manager. Otherwise, returns None when manager is missing.
+        """
+        cls = self.__class__
+        if _SCVI_UUID_KEY not in adata.uns:
+            if required:
+                raise ValueError(
+                    f"Please set up your AnnData with {cls.__name__}.setup_anndata'"
+                    "or {cls.__name__}.setup_mudata first."
+                )
+            return None
+
+        adata_id = adata.uns[_SCVI_UUID_KEY]
+        if self.id not in cls._per_instance_manager_store:
+            if required:
+                raise AssertionError(
+                    "Unable to find instance specific manager store. "
+                    "The model has likely not been initialized with an AnnData object."
+                )
+            return None
+        elif adata_id not in cls._per_instance_manager_store[self.id]:
+            if required:
+                raise AssertionError("Please call ``self._validate_anndata`` on this AnnData or MuData object.")
+            return None
+
+        adata_manager = cls._per_instance_manager_store[self.id][adata_id]
+        if adata_manager.adata is not adata:
+            logger.info("AnnData object appears to be a copy. Attempting to transfer setup.")
+            _assign_adata_uuid(adata, overwrite=True)
+            adata_manager = self.adata_manager.transfer_fields(adata, extend_categories=auto_extend)
+            self._register_manager_for_instance(adata_manager)
+
+        return adata_manager
+
+    def maximum_likelihood_training(
+        self,
+        max_epochs=100,
+        batch_size=128,
+        learning_rate=1e-4,
+        n_samples_per_cell=10,
+        control_label: str = "Control",
+    ):
+        """Train embedding encoders using maximum likelihood on single-cell samples."""
+        # Freeze all parameters except embedding encoders
+        for name, param in self.module.named_parameters():
+            if "emp_prior_encoder" in name:
+                param.requires_grad = True
+                # print(f"Training {name}")
+            else:
+                param.requires_grad = False
+
+        optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, self.module.parameters()), lr=learning_rate)
+
+        # create dataloader
+        # remove control cells to speed up computations
+        self._validate_anndata(self.adata)
+        label_key = self.adata_manager.get_state_registry(REGISTRY_KEYS.LABELS_KEY).original_key
+        cell_indices = np.where(self.adata.obs[label_key] != control_label)[0]
+        pert_loader = self._make_data_loader(
+            adata=self.adata, indices=cell_indices, batch_size=batch_size, shuffle=True
+        )
+
+        # Training loop
+        for epoch in range(max_epochs):
+            epoch_loss = 0
+            n_batches = 0
+
+            for tensors in tqdm(pert_loader):
+                # Get data
+                x = tensors[REGISTRY_KEYS.X_KEY]
+                y = tensors[REGISTRY_KEYS.PROTEIN_EXP_KEY]
+                batch_index = tensors[REGISTRY_KEYS.BATCH_KEY]
+                embedding = tensors["emp_prior"]
+
+                # Move to device
+                x = x.to(self.module.device)
+                y = y.to(self.module.device)
+                batch_index = batch_index.to(self.module.device)
+                embedding = embedding.to(self.module.device)
+
+                # Get single-cell posteriors
+                with torch.no_grad():
+                    sc_outputs = self.module._generic_inference(x=x, y=y, batch_index=batch_index, mode="single_cell")
+
+                    # Sample from single-cell posteriors
+                    cell_z_dist = Normal(sc_outputs["qz_m"], torch.sqrt(sc_outputs["qz_v"]))
+                    cell_s_dist = Normal(sc_outputs["qs_m"], torch.sqrt(sc_outputs["qs_v"]))
+
+                    # Draw samples for each cell (n_samples_per_cell x batch_size x latent_dim)
+                    z_samples = cell_z_dist.sample((n_samples_per_cell,))
+                    s_samples = cell_s_dist.sample((n_samples_per_cell,))
+
+                # Get bulk posterior parameters for each cell
+                bulk_z_m, bulk_z_v, _ = self.module.background_emp_prior_encoder(
+                    embedding
+                )  # Shape: [batch_size, latent_dim]
+                bulk_s_m, bulk_s_v, _ = self.module.salient_emp_prior_encoder(
+                    embedding
+                )  # Shape: [batch_size, latent_dim]
+                bulk_z_m = bulk_z_m.unsqueeze(0)  # Shape: [1, batch_size, latent_dim]
+                bulk_z_v = bulk_z_v.unsqueeze(0)  # Shape: [1, batch_size, latent_dim]
+                bulk_s_m = bulk_s_m.unsqueeze(0)  # Shape: [1, batch_size, latent_dim]
+                bulk_s_v = bulk_s_v.unsqueeze(0)  # Shape: [1, batch_size, latent_dim]
+
+                # Compute log probability for each sample
+                z_log_prob = Normal(bulk_z_m, torch.sqrt(bulk_z_v)).log_prob(
+                    z_samples
+                )  # Shape: [n_samples, batch_size, latent_dim]
+                s_log_prob = Normal(bulk_s_m, torch.sqrt(bulk_s_v)).log_prob(
+                    s_samples
+                )  # Shape: [n_samples, batch_size, latent_dim]
+
+                # Sum over dimensions and average over samples for each cell
+                z_log_likelihood = z_log_prob.sum(dim=-1).mean(dim=0).mean()  # First mean over samples, then over batch
+                s_log_likelihood = s_log_prob.sum(dim=-1).mean(dim=0).mean()  # First mean over samples, then over batch
+
+                # Maximize log likelihood (minimize negative log likelihood)
+                batch_loss = -(z_log_likelihood + s_log_likelihood)
+
+                # Backward and optimize
+                optimizer.zero_grad()
+                batch_loss.backward()
+                optimizer.step()
+
+                epoch_loss += batch_loss.item()
+                n_batches += 1
+
+            # Average loss for this epoch
+            avg_epoch_loss = epoch_loss / n_batches
+            print(f"Epoch {epoch+1}/{max_epochs}, Avg NLL: {avg_epoch_loss:.6f}")
+
+        # Reset parameters
+        for param in self.module.parameters():
+            param.requires_grad = True
+
+        return self
+
+    @torch.inference_mode()
+    def get_latent_importance(
+        self,
+        adata: AnnData | None = None,
+        indices: Sequence[int] | None = None,
+        batch_size: int | None = None,
+        representation_kind: str = "salient",
+    ) -> np.ndarray:
+        """
+        Return the importance of each modality for either background or salient latent representation for each cell.
+
+        Args:
+        ----
+        adata: AnnData object with equivalent structure to initial AnnData. If `None`,
+            defaults to the AnnData object used to initialize the model.
+        indices: Indices of cells in adata to use. If `None`, all cells are used.
+        batch_size: Mini-batch size for data loading into model. Defaults to
+            `scvi.settings.batch_size`.
+        representation_kind: Either "background" or "salient" for the corresponding
+            representation kind.
+
+        Returns
+        -------
+        dict[str, np.ndarray]
+            A dictionary containing three numpy arrays, each with shape (n_cells,):
+            - 'exp': Importance of gene expression for each cell's latent representation.
+            - 'chr': Importance of chromatin accessibility for each cell's latent representation.
+            - 'pro': Importance of protein expression for each cell's latent representation.
+
+        """
+        available_representation_kinds = ["background", "salient"]
+        assert representation_kind in available_representation_kinds, (
+            f"representation_kind = {representation_kind} is not one of" f" {available_representation_kinds}"
+        )
+
+        adata = self._validate_anndata(adata)
+        data_loader = self._make_data_loader(
+            adata=adata,
+            indices=indices,
+            batch_size=batch_size,
+            shuffle=False,
+            data_loader_class=AnnDataLoader,
+        )
+        latent_imp_exp = []
+        latent_imp_pro = []
+        latent_imp_chr = []
+        for tensors in data_loader:
+            x = tensors[REGISTRY_KEYS.X_KEY]
+            y = tensors[REGISTRY_KEYS.PROTEIN_EXP_KEY]
+            batch_index = tensors[REGISTRY_KEYS.BATCH_KEY]
+            outputs = self.module._generic_inference(x=x, y=y, batch_index=batch_index, n_samples=1)
+
+            key = "z" if representation_kind == "background" else "s"
+            mus = torch.stack(
+                [
+                    outputs[f"q{key}_exp_m"],
+                    outputs[f"q{key}_chr_m"],
+                    outputs[f"q{key}_pro_m"],
+                ],
+                dim=-1,
+            )  # batch, dimension, modality
+            vars = torch.stack(
+                [
+                    outputs[f"q{key}_exp_v"],
+                    outputs[f"q{key}_chr_v"],
+                    outputs[f"q{key}_pro_v"],
+                ],
+                dim=-1,
+            )  # batch, dimension, modality
+            mus_joint = torch.sum(mus / vars, dim=-1)  # batch size, dimension
+            vars_joint = torch.zeros_like(mus_joint) + torch.sum(1.0 / vars, dim=-1)
+            vars_joint = 1.0 / vars_joint  # inverse
+            mus_joint *= vars_joint
+            top_vector = vars_joint[:, :, None] * mus / (vars)
+            mus_contrib = torch.sum((top_vector) ** 2, dim=1) / torch.sum(
+                mus_joint[:, :, None] ** 2, dim=1
+            )  # batch, modality
+            latent_imp_exp += [mus_contrib[:, 0].detach().cpu()]
+            latent_imp_chr += [mus_contrib[:, 1].detach().cpu()]
+            latent_imp_pro += [mus_contrib[:, 2].detach().cpu()]
+        return {
+            "exp": torch.cat(latent_imp_exp).numpy(),
+            "chr": torch.cat(latent_imp_chr).numpy(),
+            "pro": torch.cat(latent_imp_pro).numpy(),
+        }
+
+    @torch.inference_mode()
+    def get_latent_representation(
+        self,
+        adata: AnnData | None = None,
+        indices: Sequence[int] | None = None,
+        give_mean: bool = True,
+        batch_size: int | None = None,
+        representation_kind: str = "salient",
+        partial_modality: str | None = None,
+    ) -> np.ndarray:
+        """
+        Return the background or salient latent representation for each cell.
+
+        Args:
+        ----
+        adata: AnnData object with equivalent structure to initial AnnData. If `None`,
+            defaults to the AnnData object used to initialize the model.
+        indices: Indices of cells in adata to use. If `None`, all cells are used.
+        give_mean: Give mean of distribution or sample from it.
+        batch_size: Mini-batch size for data loading into model. Defaults to
+            `scvi.settings.batch_size`.
+        representation_kind: Either "background" or "salient" for the corresponding
+            representation kind.
+        partial_modality: If not None, return the latent representation for the
+            specified modality. One of ["exp", "pro", "chr"].
+
+        Returns
+        -------
+            A numpy array with shape `(n_cells, n_latent)`.
+        """
+        available_representation_kinds = ["background", "salient"]
+        assert representation_kind in available_representation_kinds, (
+            f"representation_kind = {representation_kind} is not one of" f" {available_representation_kinds}"
+        )
+
+        adata = self._validate_anndata(adata)
+        data_loader = self._make_data_loader(
+            adata=adata,
+            indices=indices,
+            batch_size=batch_size,
+            shuffle=False,
+            data_loader_class=AnnDataLoader,
+        )
+        latent = []
+        for tensors in data_loader:
+            x = tensors[REGISTRY_KEYS.X_KEY]
+            y = tensors[REGISTRY_KEYS.PROTEIN_EXP_KEY]
+            batch_index = tensors[REGISTRY_KEYS.BATCH_KEY]
+            outputs = self.module._generic_inference(x=x, y=y, batch_index=batch_index, n_samples=1)
+
+            if partial_modality is not None and partial_modality != "":
+                give_mean = True
+                if partial_modality == "exp":
+                    key = "z_exp" if representation_kind == "background" else "s_exp"
+                elif partial_modality == "pro":
+                    key = "z_pro" if representation_kind == "background" else "s_pro"
+                elif partial_modality == "chr":
+                    key = "z_chr" if representation_kind == "background" else "s_chr"
+                else:
+                    raise ValueError(f"partial_modality = {partial_modality} is not one of" f" ['exp', 'pro', 'chr']")
+                latent_sample = outputs[f"q{key}_m"]
+            else:
+                # full modality
+                if representation_kind == "background":
+                    latent_m = outputs["qz_m"]
+                    latent_sample = outputs["z"]
+                else:
+                    latent_m = outputs["qs_m"]
+                    latent_sample = outputs["s"]
+
+                if give_mean:
+                    latent_sample = latent_m
+
+            latent += [latent_sample.detach().cpu()]
+        return torch.cat(latent).numpy()
+
+    @torch.inference_mode()
+    def get_normalized_outputs(
+        self,
+        adata: AnnData | None = None,
+        indices: Sequence[int] | None = None,
+        transform_batch: Sequence[Number | str] | None = None,
+        n_samples: int = 1,
+        n_samples_overall: int | None = None,
+        batch_size: int | None = None,
+        return_mean: bool = True,
+        disable_tqdm: bool | None = False,
+        mode_inference: Literal["single_cell", "bulk"] = "single_cell",
+    ) -> dict[str, np.ndarray | pd.DataFrame]:
+        """
+        Return the normalized (decoded) outputs.
+
+        Args:
+        ----
+        adata: AnnData object with equivalent structure to initial AnnData. If `None`,
+            defaults to the AnnData object used to initialize the model.
+        indices: Indices of cells in adata to use. If `None`, all cells are used.
+        transform_batch: Batch to condition on. If transform_batch is:
+            - None, then real observed batch is used.
+            - int, then batch transform_batch is used.
+        n_samples: Number of posterior samples to use for estimation.
+        n_samples_overall: The number of random samples in `adata` to use.
+        batch_size: Mini-batch size for data loading into model. Defaults to
+            `scvi.settings.batch_size`.
+        return_mean: Whether to return the mean of the samples.
+        disable_tqdm: Disable progress bar.
+
+        Returns
+        -------
+            A dictionary containing two keys, 'background' and 'salient', each containing
+            a dictionary with keys 'exp', 'pro', and 'chr' for the corresponding modality.
+            This dictionary contains the normalized output values for that modality.
+            If `n_samples` > 1 and `return_mean` is `False`, then the shape is
+            `(samples, cells, features)`. Otherwise, shape is `(cells, features)`.
+        """
+        adata = self._validate_anndata(adata)
+        if indices is None:
+            indices = np.arange(adata.n_obs)
+        if n_samples_overall is not None:
+            indices = np.random.choice(indices, n_samples_overall)
+        data_loader = self._make_data_loader(
+            adata=adata,
+            indices=indices,
+            batch_size=batch_size,
+            shuffle=False,
+            data_loader_class=AnnDataLoader,
+        )
+
+        transform_batch = _get_batch_code_from_category(self.get_anndata_manager(adata, required=True), transform_batch)
+
+        background_exprs = []
+        salient_exprs = []
+        background_pros = []
+        salient_pros = []
+        background_chrs = []
+        salient_chrs = []
+        for tensors in tqdm(data_loader, disable=disable_tqdm):
+            x = tensors[REGISTRY_KEYS.X_KEY]
+            batch_index = tensors[REGISTRY_KEYS.BATCH_KEY]
+            y = tensors[REGISTRY_KEYS.PROTEIN_EXP_KEY]
+            emp_prior = tensors["emp_prior"]
+            background_per_batch_exprs = []
+            salient_per_batch_exprs = []
+            background_per_batch_pros = []
+            salient_per_batch_pros = []
+            background_per_batch_chrs = []
+            salient_per_batch_chrs = []
+            for batch in transform_batch:
+                if batch is not None:
+                    batch_index = torch.ones_like(batch_index) * batch
+
+                # first get latent variables
+                inference_outputs = self.module._generic_inference(
+                    x=x, y=y, batch_index=batch_index, emp_prior=emp_prior, mode=mode_inference, n_samples=n_samples
+                )
+                z = inference_outputs["z"]
+                s = inference_outputs["s"]
+                library_rna = inference_outputs["library_rna"]
+                library_acc = inference_outputs["library_acc"]
+
+                # second, get imputed values for background
+                background_generative_outputs = self.module._generic_generative(
+                    z=z,
+                    s=torch.zeros_like(s),
+                    library_rna=library_rna,
+                    library_acc=library_acc,
+                    batch_index=batch_index,
+                )
+                background_outputs = self._scale_and_numpy(background_generative_outputs)
+                (
+                    background_exprs_,
+                    background_pros_,
+                    background_chrs_,
+                ) = background_outputs
+                background_per_batch_exprs.append(background_exprs_)
+                background_per_batch_pros.append(background_pros_)
+                background_per_batch_chrs.append(background_chrs_)
+
+                # now get them for salient
+                salient_generative_outputs = self.module._generic_generative(
+                    z=z,
+                    s=s,
+                    library_rna=library_rna,
+                    library_acc=library_acc,
+                    batch_index=batch_index,
+                )
+                salient_outputs = self._scale_and_numpy(salient_generative_outputs)
+                salient_exprs_, salient_pros_, salient_chrs_ = salient_outputs
+                salient_per_batch_exprs.append(salient_exprs_)
+                salient_per_batch_pros.append(salient_pros_)
+                salient_per_batch_chrs.append(salient_chrs_)
+
+            # then format and assemble values,
+            # Shape above is (len(transform_batch) x batch_size x n_var).
+            background_per_batch_exprs = np.stack(background_per_batch_exprs)
+            salient_per_batch_exprs = np.stack(salient_per_batch_exprs)
+            background_per_batch_pros = np.stack(background_per_batch_pros)
+            salient_per_batch_pros = np.stack(salient_per_batch_pros)
+            background_per_batch_chrs = np.stack(background_per_batch_chrs)
+            salient_per_batch_chrs = np.stack(salient_per_batch_chrs)
+            # average per batch (note: it might be better to average the LFC, not the GEX...)
+            background_exprs += [background_per_batch_exprs.mean(0)]
+            salient_exprs += [salient_per_batch_exprs.mean(0)]
+            background_pros += [background_per_batch_pros.mean(0)]
+            salient_pros += [salient_per_batch_pros.mean(0)]
+            background_chrs += [background_per_batch_chrs.mean(0)]
+            salient_chrs += [salient_per_batch_chrs.mean(0)]
+
+        if n_samples > 1:
+            # The -2 axis correspond to cells.
+            background_exprs = np.concatenate(background_exprs, axis=-2)
+            salient_exprs = np.concatenate(salient_exprs, axis=-2)
+            background_pros = np.concatenate(background_pros, axis=-2)
+            salient_pros = np.concatenate(salient_pros, axis=-2)
+            background_chrs = np.concatenate(background_chrs, axis=-2)
+            salient_chrs = np.concatenate(salient_chrs, axis=-2)
+        else:
+            background_exprs = np.concatenate(background_exprs, axis=0)
+            salient_exprs = np.concatenate(salient_exprs, axis=0)
+            background_pros = np.concatenate(background_pros, axis=0)
+            salient_pros = np.concatenate(salient_pros, axis=0)
+            background_chrs = np.concatenate(background_chrs, axis=0)
+            salient_chrs = np.concatenate(salient_chrs, axis=0)
+
+        if n_samples > 1 and return_mean:
+            background_exprs = background_exprs.mean(0)
+            salient_exprs = salient_exprs.mean(0)
+            background_pros = background_pros.mean(0)
+            salient_pros = salient_pros.mean(0)
+            background_chrs = background_chrs.mean(0)
+            salient_chrs = salient_chrs.mean(0)
+
+        return {
+            "background": {
+                "exp": background_exprs,
+                "pro": background_pros,
+                "chr": background_chrs,
+            },
+            "salient": {"exp": salient_exprs, "pro": salient_pros, "chr": salient_chrs},
+        }
+
+    @torch.inference_mode()
+    def get_specific_normalized_outputs(
+        self,
+        adata: AnnData | None = None,
+        indices: Sequence[int] | None = None,
+        transform_batch: Sequence[Number | str] | None = None,
+        n_samples: int = 1,
+        n_samples_overall: int | None = None,
+        batch_size: int | None = None,
+        return_mean: bool = True,
+        output_type: str | None = None,
+        indices_to_return_salient: Sequence[int] | None = None,
+        modality_key: str | None = "exp",  # one of ["exp", "pro", "chr"]
+        mode_inference: Literal["single_cell", "bulk"] = "single_cell",
+        disable_tqdm: bool | None = False,
+    ):
+        """
+        Return the normalized (decoded) feature output.
+
+        Outputs are decoded from either the background or salient latent space.
+        One of `output_type` or `indices_to_return_salient` should have an input
+        argument.
+
+        Args:
+        ----
+        adata: AnnData object with equivalent structure to initial AnnData. If `None`,
+            defaults to the AnnData object used to initialize the model.
+        indices: Indices of cells in adata to use. If `None`, all cells are used.
+        transform_batch: Batch to condition on. If transform_batch is:
+            - None, then real observed batch is used.
+            - int, then batch transform_batch is used.
+        n_samples: Number of posterior samples to use for estimation.
+        n_samples_overall: The number of random samples in `adata` to use.
+        batch_size: Mini-batch size for data loading into model. Defaults to
+            `scvi.settings.batch_size`.
+        return_mean: Whether to return the mean of the samples.
+        output_type: One of {"salient", "background"} to specify the type of
+            normalized expression to return.
+        indices_to_return_salient: If `indices` is a subset of
+            `indices_to_return_salient`, normalized expressions derived from background
+            and salient latent embeddings are returned. If `indices` is not `None` and
+            is not a subset of `indices_to_return_salient`, normalized expressions
+            derived only from background latent embeddings are returned.
+        modality_key: One of ["exp", "pro", "chr"].
+        disable_tqdm: Disable progress bar.
+
+        Returns
+        -------
+            If `n_samples` > 1 and `return_mean` is `False`, then the shape is
+            `(samples, cells, genes)`. Otherwise, shape is `(cells, genes)`.
+        """
+        is_output_type_none = output_type is None
+        is_indices_to_return_salient_none = indices_to_return_salient is None
+        if is_output_type_none and is_indices_to_return_salient_none:
+            raise ValueError(
+                "Both expression_type and indices_to_return_salient are None! "
+                "Exactly one of them needs to be supplied with an input argument."
+            )
+        elif (not is_output_type_none) and (not is_indices_to_return_salient_none):
+            raise ValueError(
+                "Both expression_type and indices_to_return_salient have an input "
+                "argument! Exactly one of them needs to be supplied with an input "
+                "argument."
+            )
+        else:
+            outputs = self.get_normalized_outputs(
+                adata=adata,
+                indices=indices,
+                transform_batch=transform_batch,
+                n_samples=n_samples,
+                n_samples_overall=n_samples_overall,
+                batch_size=batch_size,
+                return_mean=return_mean,
+                disable_tqdm=disable_tqdm,
+                mode_inference=mode_inference,
+            )
+            if not is_output_type_none:
+                return outputs[output_type][modality_key]
+            else:
+                if indices is None:
+                    indices = np.arange(adata.n_obs)
+                if set(indices).issubset(set(indices_to_return_salient)):
+                    return outputs["salient"][modality_key]
+                else:
+                    return outputs["background"][modality_key]
+
+    def differential_abundance(
+        self,
+        adata: AnnData | None = None,
+        groupby: str | None = None,
+        group1: Iterable[str] | None = None,
+        group2: str | None = None,
+        idx1: Sequence[int] | Sequence[bool] | str | None = None,
+        idx2: Sequence[int] | Sequence[bool] | str | None = None,
+        modality_key: str | None = "exp",  # one of ["exp", "pro", "chr"]
+        mode_inference: Literal["single_cell", "bulk"] = "single_cell",
+        mode: str = "change",
+        delta: float = 0.25,
+        batch_size: int | None = None,
+        all_stats: bool = True,
+        batch_correction: bool = False,
+        batchid1: Iterable[str] | None = None,
+        batchid2: Iterable[str] | None = None,
+        fdr_target: float = 0.05,
+        silent: bool = False,
+        target_idx: Sequence[int] | None = None,
+        n_samples: int = 1,
+        **kwargs,
+    ) -> pd.DataFrame:
+        r"""
+        Perform differential expression analysis.
+
+        Args:
+        ----
+        adata: AnnData object with equivalent structure to initial AnnData. If `None`,
+            defaults to the AnnData object used to initialize the model.
+        groupby: The key of the observations grouping to consider.
+        group1: Subset of groups, e.g. ["g1", "g2", "g3"], to which comparison shall be
+            restricted, or all groups in `groupby` (default).
+        group2: If `None`, compare each group in `group1` to the union of the rest of
+            the groups in `groupby`. If a group identifier, compare with respect to this
+            group.
+        idx1: `idx1` and `idx2` can be used as an alternative to the AnnData keys.
+            Custom identifier for `group1` that can be of three sorts:
+            (1) a boolean mask, (2) indices, or (3) a string. If it is a string, then
+            it will query indices that verifies conditions on adata.obs, as described
+            in `pandas.DataFrame.query()`. If `idx1` is not `None`, this option
+            overrides `group1` and `group2`.
+        idx2: Custom identifier for `group2` that has the same properties as `idx1`.
+            By default, includes all cells not specified in `idx1`.
+        modality_key: One of ["exp", "pro", "chr"].
+        mode: Method for differential expression. See
+            https://docs.scvi-tools.org/en/0.14.1/user_guide/background/differential_expression.html
+            for more details.
+        delta: Specific case of region inducing differential expression. In this case,
+            we suppose that R\[-delta, delta] does not induce differential expression
+            (change model default case).
+        batch_size: Mini-batch size for data loading into model. Defaults to
+            scvi.settings.batch_size.
+        all_stats: Concatenate count statistics (e.g., mean expression group 1) to DE
+            results.
+        batch_correction: Whether to correct for batch effects in DE inference.
+        batchid1: Subset of categories from `batch_key` registered in `setup_anndata`,
+            e.g. ["batch1", "batch2", "batch3"], for `group1`. Only used if
+            `batch_correction` is `True`, and by default all categories are used.
+        batchid2: Same as `batchid1` for `group2`. `batchid2` must either have null
+            intersection with `batchid1`, or be exactly equal to `batchid1`. When the
+            two sets are exactly equal, cells are compared by decoding on the same
+            batch. When sets have null intersection, cells from `group1` and `group2`
+            are decoded on each group in `group1` and `group2`, respectively.
+        fdr_target: Tag features as DE based on posterior expected false discovery rate.
+        silent: If `True`, disables the progress bar. Default: `False`.
+        target_idx: If not `None`, a boolean or integer identifier should be used for
+            cells in the target group. Normalized expression values derived
+            from both salient and background latent embeddings are used when
+            {group1, group2} is a subset of the target group, otherwise background
+            normalized expression values are used.
+
+        **kwargs: Keyword args for
+            `mocavi._differential.DifferentialComputation.get_bayes_factors`.
+
+        Returns
+        -------
+        Differential expression DataFrame.
+        """
+        adata = self._validate_anndata(adata)
+
+        if target_idx is not None:
+            target_idx = np.array(target_idx)
+            if target_idx.dtype is np.dtype("bool"):
+                assert len(target_idx) == adata.n_obs, "target_idx mask must be the same length as adata!"
+                target_idx = np.arange(adata.n_obs)[target_idx]
+            model_fn = partial(
+                self.get_specific_normalized_outputs,
+                n_samples=n_samples,
+                batch_size=batch_size,
+                output_type=None,
+                modality_key=modality_key,
+                indices_to_return_salient=target_idx,
+                disable_tqdm=True,
+                mode_inference=mode_inference,
+            )
+        else:
+            model_fn = partial(
+                self.get_specific_normalized_outputs,
+                n_samples=n_samples,
+                batch_size=batch_size,
+                output_type="salient",
+                modality_key=modality_key,
+                indices_to_return_salient=None,
+                disable_tqdm=True,
+                mode_inference=mode_inference,
+            )
+
+        if modality_key == "exp" or modality_key == "chr":
+            var_idx = slice(0, self.n_genes) if modality_key == "exp" else slice(self.n_genes, None)
+            col_names = adata.var_names[var_idx]
+            raw_data_fn = partial(scrna_raw_counts_properties, var_idx=var_idx)
+        else:  # pro
+            var_idx = slice(None, None)
+            col_names = adata.uns["protein_names"][var_idx]
+            raw_data_fn = adt_raw_counts_properties
+
+        result = _de_core(
+            self.get_anndata_manager(adata, required=True),
+            model_fn,
+            groupby=groupby,
+            group1=group1,
+            group2=group2,
+            idx1=idx1,
+            idx2=idx2,
+            all_stats=all_stats,
+            all_stats_fn=raw_data_fn,
+            col_names=col_names,
+            mode=mode,
+            batchid1=batchid1,
+            batchid2=batchid2,
+            delta=delta,
+            batch_correction=batch_correction,
+            fdr=fdr_target,
+            silent=silent,
+            **kwargs,
+        )
+        return result
+
+    def synthetic_differential_abundance(
+        self,
+        adata: AnnData | None = None,
+        groupby: str | None = None,
+        group1: Iterable[str] | None = None,
+        idx1: Sequence[int] | Sequence[bool] | str | None = None,
+        modality_key: str | None = "exp",  # one of ["exp", "pro", "chr"]
+        mode: str = "change",
+        delta: float = 0.25,
+        batch_size: int | None = None,
+        all_stats: bool = True,
+        batch_correction: bool = False,
+        batchid1: Iterable[str] | None = None,
+        fdr_target: float = 0.05,
+        silent: bool = False,
+        n_samples: int = 1,
+        **kwargs,
+    ) -> pd.DataFrame:
+        r"""
+        Perform synthetic differential abundance analysis.
+
+        Note that these calculation is based on the synthetic data generated by the model, and is not
+        directly comparable to the fold-change values obtained from the real data. Notably, the model generates
+        counterfactual data, imputing what would happen if the cells were had the same background but zeroed out
+        salient variables.
+
+        Args:
+        ----
+        adata: AnnData object with equivalent structure to initial AnnData. If `None`,
+            defaults to the AnnData object used to initialize the model.
+        groupby: The key of the observations grouping to consider.
+        group1: Subset of groups, e.g. ["g1", "g2", "g3"], to which comparison shall be
+            restricted, or all groups in `groupby` (default).
+        idx1: `idx1` and `idx2` can be used as an alternative to the AnnData keys.
+            Custom identifier for `group1` that can be of three sorts:
+            (1) a boolean mask, (2) indices, or (3) a string. If it is a string, then
+            it will query indices that verifies conditions on adata.obs, as described
+            in `pandas.DataFrame.query()`. If `idx1` is not `None`, this option
+            overrides `group1` and `group2`.
+        modality_key: One of ["exp", "pro", "chr"].
+        mode: Method for differential expression. See
+            https://docs.scvi-tools.org/en/0.14.1/user_guide/background/differential_expression.html
+            for more details.
+        delta: Specific case of region inducing differential expression. In this case,
+            we suppose that R\[-delta, delta] does not induce differential expression
+            (change model default case).
+        batch_size: Mini-batch size for data loading into model. Defaults to
+            scvi.settings.batch_size.
+        all_stats: Concatenate count statistics (e.g., mean expression group 1) to DE
+            results.
+        batch_correction: Whether to correct for batch effects in DE inference.
+        batchid1: Subset of categories from `batch_key` registered in `setup_anndata`,
+            e.g. ["batch1", "batch2", "batch3"], for `group1`. Only used if
+            `batch_correction` is `True`, and by default all categories are used.
+        fdr_target: Tag features as DE based on posterior expected false discovery rate.
+        silent: If `True`, disables the progress bar. Default: `False`.
+        n_samples: Number of posterior samples to use for estimation.
+
+        **kwargs: Keyword args for
+            `mocavi._differential.DifferentialComputation.get_bayes_factors`.
+
+        Returns
+        -------
+        Differential expression DataFrame.
+        """
+        adata = self._validate_anndata(adata)
+
+        model_fn1 = partial(
+            self.get_specific_normalized_outputs,
+            n_samples=n_samples,
+            batch_size=batch_size,
+            output_type="salient",
+            modality_key=modality_key,
+            indices_to_return_salient=None,
+            disable_tqdm=True,
+        )
+        model_fn2 = partial(
+            self.get_specific_normalized_outputs,
+            n_samples=n_samples,
+            batch_size=batch_size,
+            output_type="background",
+            modality_key=modality_key,
+            indices_to_return_salient=None,
+            disable_tqdm=True,
+        )
+
+        if modality_key == "exp" or modality_key == "chr":
+            var_idx = slice(0, self.n_genes) if modality_key == "exp" else slice(self.n_genes, None)
+            col_names = adata.var_names[var_idx]
+            raw_data_fn = partial(scrna_raw_counts_properties, var_idx=var_idx)
+        else:  # pro
+            var_idx = slice(None, None)
+            col_names = adata.uns["protein_names"][var_idx]
+            raw_data_fn = adt_raw_counts_properties
+
+        result = _de_paired_test_core(
+            self.get_anndata_manager(adata, required=True),
+            model_fn1,
+            model_fn2,
+            groupby=groupby,
+            group1=group1,
+            idx1=idx1,
+            all_stats=all_stats,
+            all_stats_fn=raw_data_fn,
+            col_names=col_names,
+            mode=mode,
+            batchid1=batchid1,
+            delta=delta,
+            batch_correction=batch_correction,
+            fdr=fdr_target,
+            silent=silent,
+            **kwargs,
+        )
+        return result
+
+    @staticmethod
+    @torch.inference_mode()
+    def _scale_and_numpy(
+        generative_outputs: dict[str, torch.Tensor],
+    ) -> np.ndarray:
+        # expression
+        output_expr = generative_outputs["px_scale"]
+        output_expr = output_expr.cpu().numpy()
+        # proteins
+        py_ = generative_outputs["py_"]
+        protein_mixing = 1 / (1 + torch.exp(-py_["mixing"]))
+        protein_val = py_["rate_fore"] * (1 - protein_mixing)
+        output_pro = protein_val.cpu().numpy()
+        # chromatin
+        output_chr = generative_outputs["paccess_scale"]
+        output_chr = output_chr.cpu().numpy()
+        return output_expr, output_pro, output_chr
+
+    @torch.inference_mode()
+    def get_label_synthetic_fold_change(
+        self,
+        labels: Sequence[str] | None = None,
+        batch_size: int | None = None,
+        n_samples: int = 100,
+        library_rna: float = 1e4,
+        library_acc: float = 1e4,
+    ):
+        """
+        Get synthetic fold change for each label and each modality.
+
+        This typically is faster to compute than the full synthetic differential abundance (because it does not
+        require to compute statistical significance for differential abundance for each pair of labels).
+
+        Note that this fold-change calculation is based on the synthetic data generated by the model, and is not
+        directly comparable to the fold-change values obtained from the real data. Notably, the model generates
+        counterfactual data, imputing what would happen if the cells were had the same background but zeroed out
+        salient variables.
+
+        Args:
+        ----
+        labels: List of labels we are interested in for differential computations. If `None`, all labels are used.
+        batch_size: Mini-batch size for data loading into model. Defaults to
+            `scvi.settings.batch_size`.
+        n_samples: Number of posterior samples to use for estimation.
+        library_rna: Library size for scaling RNA measurements.
+        library_acc: Library size for scaling ATAC measurements
+
+        Returns
+        -------
+        A dictionary containing three keys, 'fold_change_exprs', 'fold_change_pros', and 'fold_change_chr',
+        each containing a dataframe with the fold change values for each label.
+        """
+        self._validate_anndata(self.adata)
+
+        if labels is None:
+            # get label naming conventions
+            ordered_label_treatment_list = self.adata_manager.get_state_registry("labels").items()[0][1]
+            indices = None
+            n_labels = len(ordered_label_treatment_list)
+        else:
+            # check if all samples in adata have a label
+            assert self.adata.n_obs == len(labels)
+            # get label naming conventions
+            ordered_label_treatment_list = np.unique(labels)
+            indices = None
+            n_labels = len(ordered_label_treatment_list)
+
+        data_loader = self._make_data_loader(
+            adata=self.adata,
+            indices=indices,
+            batch_size=batch_size,
+            shuffle=False,
+            data_loader_class=AnnDataLoader,
+        )
+
+        label_counts = np.zeros(shape=(n_labels,))
+        salient_sum_exprs = np.zeros(shape=(n_labels, self.n_genes))
+        salient_sum_pros = np.zeros(shape=(n_labels, self.summary_stats["n_proteins"]))
+        salient_sum_chr = np.zeros(shape=(n_labels, self.n_regions))
+
+        background_sum_exprs = np.zeros(shape=(n_labels, self.n_genes))
+        background_sum_pros = np.zeros(shape=(n_labels, self.summary_stats["n_proteins"]))
+        background_sum_chr = np.zeros(shape=(n_labels, self.n_regions))
+
+        # loop through data, and get stochastic approximation of the sum of expression
+        for t, tensors in tqdm(enumerate(data_loader)):
+            x = tensors[REGISTRY_KEYS.X_KEY]
+            batch_index = tensors[REGISTRY_KEYS.BATCH_KEY]
+            y = tensors[REGISTRY_KEYS.PROTEIN_EXP_KEY]
+            if labels is None:
+                label = tensors[REGISTRY_KEYS.LABELS_KEY]
+                label = label[:, 0].cpu().numpy().astype(int)
+
+            else:
+                label = labels[t * batch_size : (t + 1) * batch_size]
+                label = np.array([np.where(ordered_label_treatment_list == x)[0][0] for x in label])
+
+            # first get latent variables
+            inference_outputs = self.module._generic_inference(x=x, y=y, batch_index=batch_index, n_samples=n_samples)
+            z = inference_outputs["z"]
+            s = inference_outputs["s"]
+            library_rna_ = inference_outputs["library_rna"]
+            library_acc_ = inference_outputs["library_acc"]
+
+            # second, get imputed values from background
+            background_generative_outputs = self.module._generic_generative(
+                z=z,
+                s=torch.zeros_like(s),
+                library_rna=library_rna_,
+                library_acc=library_acc_,
+                batch_index=batch_index,
+            )
+            background_exprs_ = background_generative_outputs["px_scale"].mean(0).cpu().numpy()
+            background_chrs_ = background_generative_outputs["paccess_scale"].mean(0).cpu().numpy()
+            py_ = background_generative_outputs["py_"]
+            background_pros_ = (py_["rate_fore"] * (1 - (1 / (1 + torch.exp(-py_["mixing"]))))).mean(0).cpu().numpy()
+
+            # third, get imputed values from salient
+            salient_generative_outputs = self.module._generic_generative(
+                z=z,
+                s=s,
+                library_rna=library_rna_,
+                library_acc=library_acc_,
+                batch_index=batch_index,
+            )
+            salient_exprs_ = salient_generative_outputs["px_scale"].mean(0).cpu().numpy()
+            salient_chrs_ = salient_generative_outputs["paccess_scale"].mean(0).cpu().numpy()
+            py_ = salient_generative_outputs["py_"]
+            salient_pros_ = (py_["rate_fore"] * (1 - (1 / (1 + torch.exp(-py_["mixing"]))))).mean(0).cpu().numpy()
+            # fourth, inject imputed values into the sum of expression
+            for i in np.unique(label):
+                salient_sum_exprs[i] += salient_exprs_[label == i].sum(0)
+                salient_sum_pros[i] += salient_pros_[label == i].sum(0)
+                salient_sum_chr[i] += salient_chrs_[label == i].sum(0)
+
+                background_sum_exprs[i] += background_exprs_[label == i].sum(0)
+                background_sum_pros[i] += background_pros_[label == i].sum(0)
+                background_sum_chr[i] += background_chrs_[label == i].sum(0)
+                label_counts[i] += (label == i).sum()
+
+        # Then, normalize
+        salient_mean_exprs = salient_sum_exprs / label_counts[:, None]
+        salient_mean_pros = salient_sum_pros / label_counts[:, None]
+        salient_mean_chr = salient_sum_chr / label_counts[:, None]
+
+        background_mean_exprs = background_sum_exprs / label_counts[:, None]
+        background_mean_pros = background_sum_pros / label_counts[:, None]
+        background_mean_chr = background_sum_chr / label_counts[:, None]
+
+        # finally, get fold change
+        fold_change_exprs = np.log2(1 + library_rna * salient_mean_exprs) - np.log2(
+            1 + library_rna * background_mean_exprs
+        )
+        fold_change_pros = np.log2(0.5 + salient_mean_pros) - np.log2(0.5 + background_mean_pros)
+        fold_change_chr = np.log2(1 + library_acc * salient_mean_chr) - np.log2(1 + library_acc * background_mean_chr)
+
+        # put in a dataframe
+        fold_change_exprs = pd.DataFrame(
+            fold_change_exprs,
+            index=ordered_label_treatment_list,
+            columns=self.adata.var.index[: self.n_genes],
+        )
+        fold_change_chr = pd.DataFrame(
+            fold_change_chr,
+            index=ordered_label_treatment_list,
+            columns=self.adata.var.index[self.n_genes :],
+        )
+        fold_change_pros = pd.DataFrame(
+            fold_change_pros,
+            index=ordered_label_treatment_list,
+            columns=self.adata_manager.get_state_registry("proteins").values()[0],
+        )
+
+        # return in a dictionary
+        return {
+            "fold_change_exp": fold_change_exprs,
+            "fold_change_pro": fold_change_pros,
+            "fold_change_chr": fold_change_chr,
+        }
+
+    @torch.inference_mode()
+    def get_label_total_fold_change(
+        self,
+        labels: Sequence[str] | None = None,
+        control_label: str = "Control",
+        batch_size: int | None = None,
+        n_samples: int = 100,
+        library_rna: float = 1e4,
+        library_acc: float = 1e4,
+    ):
+        """
+        Get synthetic fold change for each label and each modality.
+
+        This typically is faster to compute than the full synthetic differential abundance (because it does not
+        require to compute statistical significance for differential abundance for each pair of labels).
+
+        Note that this fold-change calculation is based on the synthetic data generated by the model, and is not
+        directly comparable to the fold-change values obtained from the real data. Notably, the model generates
+        counterfactual data, imputing what would happen if the cells were had the same background but zeroed out
+        salient variables.
+
+        Args:
+        ----
+        labels: List of labels we are interested in for differential computations. If `None`, all labels are used.
+        batch_size: Mini-batch size for data loading into model. Defaults to
+            `scvi.settings.batch_size`.
+        n_samples: Number of posterior samples to use for estimation.
+        library_rna: Library size for scaling RNA measurements.
+        library_acc: Library size for scaling ATAC measurements
+
+        Returns
+        -------
+        A dictionary containing three keys, 'fold_change_exprs', 'fold_change_pros', and 'fold_change_chr',
+        each containing a dataframe with the fold change values for each label.
+        """
+        self._validate_anndata(self.adata)
+
+        if labels is None:
+            # get label naming conventions
+            ordered_label_treatment_list = self.adata_manager.get_state_registry("labels").items()[0][1]
+            indices = None
+            n_labels = len(ordered_label_treatment_list)
+        else:
+            # check if all samples in adata have a label
+            assert self.adata.n_obs == len(labels)
+            # get label naming conventions
+            ordered_label_treatment_list = np.unique(labels)
+            indices = None
+            n_labels = len(ordered_label_treatment_list)
+
+        data_loader = self._make_data_loader(
+            adata=self.adata,
+            indices=indices,
+            batch_size=batch_size,
+            shuffle=False,
+            data_loader_class=AnnDataLoader,
+        )
+
+        # get control indices
+        label_key = self.adata_manager.get_state_registry(REGISTRY_KEYS.LABELS_KEY).original_key
+        control_indices = np.where(self.adata.obs[label_key] == control_label)[0]
+        if len(control_indices) == 0:
+            raise ValueError(f"No control cells found with label '{control_label}' in adata.obs['{label_key}'].")
+        control_data_loader = self._make_data_loader(
+            adata=self.adata,
+            indices=control_indices,
+            batch_size=batch_size,
+            shuffle=False,
+            data_loader_class=AnnDataLoader,
+        )
+
+        label_counts = np.zeros(shape=(n_labels,))
+        label_sum_exprs = np.zeros(shape=(n_labels, self.n_genes))
+        label_sum_pros = np.zeros(shape=(n_labels, self.summary_stats["n_proteins"]))
+        label_sum_chr = np.zeros(shape=(n_labels, self.n_regions))
+
+        background_exprs = np.zeros(shape=(self.n_genes))
+        background_pros = np.zeros(shape=(self.summary_stats["n_proteins"]))
+        background_chrs = np.zeros(shape=(self.n_regions))
+
+        # background first
+        # loop through data, and get stochastic approximation of the sum of expression
+        for tensors in tqdm(control_data_loader):
+            x = tensors[REGISTRY_KEYS.X_KEY]
+            batch_index = tensors[REGISTRY_KEYS.BATCH_KEY]
+            y = tensors[REGISTRY_KEYS.PROTEIN_EXP_KEY]
+
+            # first get latent variables
+            inference_outputs = self.module._generic_inference(x=x, y=y, batch_index=batch_index, n_samples=n_samples)
+            z = inference_outputs["z"]
+            s = inference_outputs["s"]
+            library_rna_ = inference_outputs["library_rna"]
+            library_acc_ = inference_outputs["library_acc"]
+
+            # second, get imputed values from background
+            background_generative_outputs = self.module._generic_generative(
+                z=z,
+                s=torch.zeros_like(s),
+                library_rna=library_rna_,
+                library_acc=library_acc_,
+                batch_index=batch_index,
+            )
+            background_exprs_ = background_generative_outputs["px_scale"].mean(0).cpu().numpy()
+            background_chrs_ = background_generative_outputs["paccess_scale"].mean(0).cpu().numpy()
+            py_ = background_generative_outputs["py_"]
+            background_pros_ = (py_["rate_fore"] * (1 - (1 / (1 + torch.exp(-py_["mixing"]))))).mean(0).cpu().numpy()
+            # third, inject imputed values into the sum of expression
+            background_exprs += background_exprs_.mean(0) / len(control_data_loader)
+            background_pros += background_pros_.mean(0) / len(control_data_loader)
+            background_chrs += background_chrs_.mean(0) / len(control_data_loader)
+
+        # loop through data, and get stochastic approximation of the sum of expression
+        for t, tensors in tqdm(enumerate(data_loader)):
+            x = tensors[REGISTRY_KEYS.X_KEY]
+            batch_index = tensors[REGISTRY_KEYS.BATCH_KEY]
+            y = tensors[REGISTRY_KEYS.PROTEIN_EXP_KEY]
+            if labels is None:
+                label = tensors[REGISTRY_KEYS.LABELS_KEY]
+                label = label[:, 0].cpu().numpy().astype(int)
+
+            else:
+                label = labels[t * batch_size : (t + 1) * batch_size]
+                label = np.array([np.where(ordered_label_treatment_list == x)[0][0] for x in label])
+
+            # first get latent variables
+            inference_outputs = self.module._generic_inference(x=x, y=y, batch_index=batch_index, n_samples=n_samples)
+            z = inference_outputs["z"]
+            s = inference_outputs["s"]
+            library_rna_ = inference_outputs["library_rna"]
+            library_acc_ = inference_outputs["library_acc"]
+
+            # second, get imputed values from salient
+            salient_generative_outputs = self.module._generic_generative(
+                z=z,
+                s=s,
+                library_rna=library_rna_,
+                library_acc=library_acc_,
+                batch_index=batch_index,
+            )
+            salient_exprs_ = salient_generative_outputs["px_scale"].mean(0).cpu().numpy()
+            salient_chrs_ = salient_generative_outputs["paccess_scale"].mean(0).cpu().numpy()
+            py_ = salient_generative_outputs["py_"]
+            salient_pros_ = (py_["rate_fore"] * (1 - (1 / (1 + torch.exp(-py_["mixing"]))))).mean(0).cpu().numpy()
+            # fourth, inject imputed values into the sum of expression
+            for i in np.unique(label):
+                label_sum_exprs[i] += salient_exprs_[label == i].sum(0)
+                label_sum_pros[i] += salient_pros_[label == i].sum(0)
+                label_sum_chr[i] += salient_chrs_[label == i].sum(0)
+                label_counts[i] += (label == i).sum()
+
+        # Then, normalize
+        label_mean_exprs = label_sum_exprs / label_counts[:, None]
+        label_mean_pros = label_sum_pros / label_counts[:, None]
+        label_mean_chr = label_sum_chr / label_counts[:, None]
+
+        # finally, get fold change
+        fold_change_exprs = np.log2(1 + library_rna * label_mean_exprs) - np.log2(1 + library_rna * background_exprs)
+        fold_change_pros = np.log2(0.5 + label_mean_pros) - np.log2(0.5 + background_pros)
+        fold_change_chr = np.log2(1 + library_acc * label_mean_chr) - np.log2(1 + library_acc * background_chrs)
+
+        # put in a dataframe
+        fold_change_exprs = pd.DataFrame(
+            fold_change_exprs,
+            index=ordered_label_treatment_list,
+            columns=self.adata.var.index[: self.n_genes],
+        )
+        fold_change_chr = pd.DataFrame(
+            fold_change_chr,
+            index=ordered_label_treatment_list,
+            columns=self.adata.var.index[self.n_genes :],
+        )
+        fold_change_pros = pd.DataFrame(
+            fold_change_pros,
+            index=ordered_label_treatment_list,
+            columns=self.adata_manager.get_state_registry("proteins").values()[0],
+        )
+
+        # return in a dictionary
+        return {
+            "fold_change_exp": fold_change_exprs,
+            "fold_change_pro": fold_change_pros,
+            "fold_change_chr": fold_change_chr,
+        }
+
+    @torch.inference_mode()
+    def get_label_shrinkage_total_fold_change(
+        self,
+        labels: dict[str, np.ndarray] | None = None,
+        adata: AnnData | None = None,
+        batch_size: int | None = None,
+        n_samples: int = 100,
+        library_rna: float = 1e4,
+        library_acc: float = 1e4,
+        control_label: str = "Control",
+    ):
+        """
+        Get combined fold change for each label using hierarchical Product of Experts.
+
+        Combines optical screening priors with single-cell posteriors using hierarchical PoE.
+        When few cells are available, relies more on optical prior. When many cells agree,
+        relies more on single-cell data.
+
+        Args:
+        ----
+        labels: Dictionary of labels with optical embeddings. If `None`, all labels are used.
+        batch_size: Mini-batch size for data loading into model.
+        n_samples: Number of posterior samples to use for estimation.
+        library_rna: Library size for scaling RNA measurements.
+        library_acc: Library size for scaling ATAC measurements.
+
+        Returns
+        -------
+        A dictionary containing fold change values and combined embeddings for each label.
+        """
+        if adata is None:
+            adata = self.adata
+
+        self._validate_anndata(adata)
+
+        # Validate inputs
+        if labels is None or not isinstance(labels, dict):
+            raise ValueError("Labels must be provided as a dictionary.")
+
+        labels_torch = {}
+        shape_dict = None
+        for key, value in labels.items():
+            if not isinstance(value, np.ndarray):
+                raise ValueError(f"Labels for {key} must be a numpy array.")
+            labels_torch[key] = torch.tensor(value, dtype=torch.float32, device=self.module.device)
+            if shape_dict is None:
+                shape_dict = value.shape
+            elif shape_dict != value.shape:
+                raise ValueError(f"Labels for {key} must have the same shape as the other labels.")
+
+        n_labels = len(labels)
+        n_batches = self.adata_manager.summary_stats["n_batch"]
+        ordered_label_treatment_list = np.array(list(labels_torch.keys()))
+
+        # Initialize arrays
+        label_exprs = np.zeros(shape=(n_labels, self.n_genes))
+        label_pros = np.zeros(shape=(n_labels, self.summary_stats["n_proteins"]))
+        label_chr = np.zeros(shape=(n_labels, self.n_regions))
+        label_z = np.zeros(shape=(n_labels, self.module.n_background_latent))
+        label_s = np.zeros(shape=(n_labels, self.module.n_salient_latent))
+
+        # STEP 1: Get background abundance from control cells
+        self._validate_anndata(adata)
+        label_key = self.adata_manager.get_state_registry(REGISTRY_KEYS.LABELS_KEY).original_key
+        control_indices = np.where(adata.obs[label_key] == control_label)[0]
+        if len(control_indices) == 0:
+            raise ValueError(f"No control cells found with label '{control_label}' in adata.obs['{label_key}'].")
+        control_loader = self._make_data_loader(adata=adata, indices=control_indices, batch_size=100, shuffle=False)
+
+        background_exprs = np.zeros(shape=(self.n_genes))
+        background_pros = np.zeros(shape=(self.summary_stats["n_proteins"]))
+        background_chr = np.zeros(shape=(self.n_regions))
+
+        for tensors in tqdm(control_loader, desc="Computing background"):
+            x = tensors[REGISTRY_KEYS.X_KEY]
+            batch_index = tensors[REGISTRY_KEYS.BATCH_KEY]
+            y = tensors[REGISTRY_KEYS.PROTEIN_EXP_KEY]
+
+            inference_outputs = self.module._generic_inference(x=x, y=y, batch_index=batch_index, n_samples=n_samples)
+            z = inference_outputs["z"]
+            s = inference_outputs["s"]
+            library_rna_ = inference_outputs["library_rna"]
+            library_acc_ = inference_outputs["library_acc"]
+
+            background_generative_outputs = self.module._generic_generative(
+                z=z,
+                s=torch.zeros_like(s),
+                library_rna=library_rna_,
+                library_acc=library_acc_,
+                batch_index=batch_index,
+            )
+            background_exprs_ = background_generative_outputs["px_scale"].mean(0).cpu().numpy()
+            background_chrs_ = background_generative_outputs["paccess_scale"].mean(0).cpu().numpy()
+            py_ = background_generative_outputs["py_"]
+            background_pros_ = (py_["rate_fore"] * (1 - (1 / (1 + torch.exp(-py_["mixing"]))))).mean(0).cpu().numpy()
+
+            background_exprs += background_exprs_.mean(0) / len(control_loader)
+            background_pros += background_pros_.mean(0) / len(control_loader)
+            background_chr += background_chrs_.mean(0) / len(control_loader)
+
+        for key, value in tqdm(labels_torch.items(), desc="Processing labels"):
+            # Get optical priors
+            qz_m_prior, qz_v_prior, _ = self.module.background_emp_prior_encoder(value)
+            qs_m_prior, qs_v_prior, _ = self.module.salient_emp_prior_encoder(value)
+
+            # Get single-cell data for this label
+            label_key = self.adata_manager.get_state_registry(REGISTRY_KEYS.LABELS_KEY).original_key
+            label_indices = np.where(adata.obs[label_key] == key)[0]
+
+            if len(label_indices) < 3:
+                # No single-cell data, use pure optical prior
+                # Store embeddings
+                label_idx = np.where(ordered_label_treatment_list == key)[0][0]
+                label_z[label_idx] = qz_m_prior.cpu().numpy()
+                label_s[label_idx] = qs_m_prior.cpu().numpy()
+
+                # Sample from distributions
+                z = Normal(qz_m_prior, torch.sqrt(qz_v_prior)).sample((n_samples,))
+                s = Normal(qs_m_prior, torch.sqrt(qs_v_prior)).sample((n_samples,))
+
+            else:
+                # Get single-cell posteriors
+                label_loader = self._make_data_loader(
+                    adata=adata, indices=label_indices, batch_size=batch_size, shuffle=False
+                )
+
+                # Collect means and variances
+                qz_m_list = []
+                qz_v_list = []
+                qs_m_list = []
+                qs_v_list = []
+
+                for tensors in label_loader:
+                    x = tensors[REGISTRY_KEYS.X_KEY]
+                    batch_index = tensors[REGISTRY_KEYS.BATCH_KEY]
+                    y = tensors[REGISTRY_KEYS.PROTEIN_EXP_KEY]
+
+                    inference_outputs = self.module._generic_inference(
+                        x=x, y=y, batch_index=batch_index, mode="single_cell"
+                    )
+
+                    qz_m_list.append(inference_outputs["qz_m"])
+                    qz_v_list.append(inference_outputs["qz_v"])
+                    qs_m_list.append(inference_outputs["qs_m"])
+                    qs_v_list.append(inference_outputs["qs_v"])
+
+                # Concatenate all samples
+                qz_m_post = torch.cat(qz_m_list, dim=0)
+                qz_v_post = torch.cat(qz_v_list, dim=0)
+                qs_m_post = torch.cat(qs_m_list, dim=0)
+                qs_v_post = torch.cat(qs_v_list, dim=0)
+
+                # Calculate interpolation weight
+                N = qz_m_post.shape[0]
+                n_min = 10
+                n_max = 100
+                alpha = np.clip((N - n_min) / (n_max - n_min), 0, 1)
+
+                # Determine how many samples from each source
+                n_post_samples = (
+                    torch.binomial(torch.tensor(float(n_samples), dtype=float), torch.tensor(alpha, dtype=float))
+                    .int()
+                    .item()
+                )
+                n_prior_samples = n_samples - n_post_samples
+                # if alpha > 0 and alpha < 1:
+                #     print(f"Label {key}: N={N}, alpha={alpha:.2f}, n_prior={n_prior_samples}, n_post={n_post_samples}")
+
+                # Sample from prior
+                if n_prior_samples > 0:
+                    z_prior_samples = Normal(qz_m_prior, torch.sqrt(qz_v_prior)).sample((n_prior_samples,))
+                    s_prior_samples = Normal(qs_m_prior, torch.sqrt(qs_v_prior)).sample((n_prior_samples,))
+                else:
+                    z_prior_samples = torch.empty((0, qz_m_prior.shape[0]), device=qz_m_prior.device)
+                    s_prior_samples = torch.empty((0, qs_m_prior.shape[0]), device=qs_m_prior.device)
+
+                # Sample from posterior
+                if n_post_samples > 0 and N > 0:
+                    # Randomly select cells with replacement
+                    cell_indices = torch.randint(0, N, (n_post_samples,))
+
+                    # Vectorized sampling from selected cells
+                    z_post_samples = Normal(qz_m_post[cell_indices], torch.sqrt(qz_v_post[cell_indices])).sample()
+                    s_post_samples = Normal(qs_m_post[cell_indices], torch.sqrt(qs_v_post[cell_indices])).sample()
+                else:
+                    z_post_samples = torch.empty((0, qz_m_prior.shape[0]), device=qz_m_prior.device)
+                    s_post_samples = torch.empty((0, qs_m_prior.shape[0]), device=qs_m_prior.device)
+
+                # Concatenate all samples
+                z = torch.cat([z_prior_samples, z_post_samples], dim=0)
+                s = torch.cat([s_prior_samples, s_post_samples], dim=0)
+
+                # Store mean embeddings (weighted average for interpretability)
+                label_idx = np.where(ordered_label_treatment_list == key)[0][0]
+                posterior_mean_z = qz_m_post.mean(dim=0)
+                posterior_mean_s = qs_m_post.mean(dim=0)
+                label_z[label_idx] = ((1 - alpha) * qz_m_prior + alpha * posterior_mean_z).cpu().numpy()
+                label_s[label_idx] = ((1 - alpha) * qs_m_prior + alpha * posterior_mean_s).cpu().numpy()
+
+            # Repeat for each batch
+            z = z.repeat((n_batches, 1, 1))
+            s = s.repeat((n_batches, 1, 1))
+
+            batch_index = torch.arange(n_batches, dtype=torch.long, device=self.module.device)
+            batch_index = batch_index.unsqueeze(1).repeat((1, n_samples)).unsqueeze(2)
+
+            # Reshape for generation
+            z = z.reshape((n_batches * n_samples, -1))
+            s = s.reshape((n_batches * n_samples, -1))
+            batch_index = batch_index.reshape((n_batches * n_samples, -1))
+
+            # Generate from distribution
+            generative_outputs = self.module._generic_generative(
+                z=z,
+                s=s,
+                library_rna=torch.tensor(library_rna),
+                library_acc=torch.tensor(library_acc),
+                batch_index=batch_index,
+            )
+
+            exprs_ = generative_outputs["px_scale"].cpu().numpy()
+            chrs_ = generative_outputs["paccess_scale"].cpu().numpy()
+            py_ = generative_outputs["py_"]
+            pros_ = (py_["rate_fore"] * (1 - (1 / (1 + torch.exp(-py_["mixing"]))))).cpu().numpy()
+
+            label_exprs[label_idx] = exprs_.mean(0)
+            label_pros[label_idx] = pros_.mean(0)
+            label_chr[label_idx] = chrs_.mean(0)
+
+        # STEP 3: Compute fold changes
+        fold_change_exprs = np.log2(1 + library_rna * label_exprs) - np.log2(1 + library_rna * background_exprs)
+        fold_change_pros = np.log2(0.5 + label_pros) - np.log2(0.5 + background_pros)
+        fold_change_chr = np.log2(1 + library_acc * label_chr) - np.log2(1 + library_acc * background_chr)
+
+        # Create DataFrames
+        fold_change_exprs = pd.DataFrame(
+            fold_change_exprs,
+            index=ordered_label_treatment_list,
+            columns=self.adata.var.index[: self.n_genes],
+        )
+        fold_change_chr = pd.DataFrame(
+            fold_change_chr,
+            index=ordered_label_treatment_list,
+            columns=self.adata.var.index[self.n_genes :],
+        )
+        fold_change_pros = pd.DataFrame(
+            fold_change_pros,
+            index=ordered_label_treatment_list,
+            columns=self.adata_manager.get_state_registry("proteins").values()[0],
+        )
+
+        normalized_exprs = pd.DataFrame(
+            label_exprs,
+            index=ordered_label_treatment_list,
+            columns=self.adata.var.index[: self.n_genes],
+        )
+
+        salient_embedding = pd.DataFrame(
+            label_s,
+            index=ordered_label_treatment_list,
+            columns=[f"salient_{i}" for i in range(self.module.n_salient_latent)],
+        )
+        background_embedding = pd.DataFrame(
+            label_z,
+            index=ordered_label_treatment_list,
+            columns=[f"background_{i}" for i in range(self.module.n_background_latent)],
+        )
+
+        return {
+            "fold_change_exp": fold_change_exprs,
+            "fold_change_pro": fold_change_pros,
+            "fold_change_chr": fold_change_chr,
+            "normalized_exp": normalized_exprs,
+            "salient": salient_embedding,
+            "background": background_embedding,
+        }
+
+    @torch.inference_mode()
+    def get_label_prior_total_fold_change(
+        self,
+        labels: dict[str, np.ndarray] | None = None,
+        n_samples: int = 100,
+        library_rna: float = 1e4,
+        library_acc: float = 1e4,
+        control_label: str = "Control",
+    ):
+        """
+        Get total fold change for each label and each modality.
+
+        This typically is faster to compute than the full synthetic differential abundance (because it does not
+        require to compute statistical significance for differential abundance for each pair of labels).
+
+        Args:
+        ----
+        labels: List of labels we are interested in for differential computations. If `None`, all labels are used.
+        batch_size: Mini-batch size for data loading into model. Defaults to
+            `scvi.settings.batch_size`.
+        n_samples: Number of posterior samples to use for estimation.
+        library_rna: Library size for scaling RNA measurements.
+        library_acc: Library size for scaling ATAC measurements
+
+        Returns
+        -------
+        A dictionary containing three keys, 'fold_change_exprs', 'fold_change_pros', and 'fold_change_chr',
+        each containing a dataframe with the fold change values for each label.
+        """
+        # here labels must be a dictionary where the keys are the labels
+        #  and the values are the embeddings to be used for the generation
+        labels_torch = {}
+
+        if labels is None or not isinstance(labels, dict):
+            raise ValueError("Labels must be provided as a dictionary.")
+        else:
+            # check all entries in the dict have the same shape
+            shape_dict = None
+            for key, value in labels.items():
+                if not isinstance(value, np.ndarray):
+                    raise ValueError(f"Labels for {key} must be a numpy array.")
+                else:
+                    labels_torch[key] = torch.tensor(value, dtype=torch.float32, device=self.module.device)
+                if shape_dict is None:
+                    shape_dict = value.shape
+                elif shape_dict != value.shape:
+                    raise ValueError(f"Labels for {key} must have the same shape as the other labels.")
+            n_labels = len(labels)
+
+        # get the number of batches
+        n_batches = self.adata_manager.summary_stats["n_batch"]
+
+        # come up with an ordered list of labels
+        ordered_label_treatment_list = np.array(list(labels_torch.keys()))
+        label_exprs = np.zeros(shape=(n_labels, self.n_genes))
+        label_pros = np.zeros(shape=(n_labels, self.summary_stats["n_proteins"]))
+        label_chr = np.zeros(shape=(n_labels, self.n_regions))
+        label_z = np.zeros(shape=(n_labels, self.module.n_background_latent))
+        label_s = np.zeros(shape=(n_labels, self.module.n_salient_latent))
+
+        background_exprs = np.zeros(shape=(self.n_genes))
+        background_pros = np.zeros(shape=(self.summary_stats["n_proteins"]))
+        background_chr = np.zeros(shape=(self.n_regions))
+
+        # STEP 1: get the background abundance
+        # create dataloader
+        self._validate_anndata(self.adata)
+        label_key = self.adata_manager.get_state_registry(REGISTRY_KEYS.LABELS_KEY).original_key
+        control_indices = np.where(self.adata.obs[label_key] == control_label)[0]
+        if len(control_indices) == 0:
+            raise ValueError(f"No control cells found with label '{control_label}' in adata.obs['{label_key}'].")
+        control_loader = self._make_data_loader(
+            adata=self.adata, indices=control_indices, batch_size=100, shuffle=False
+        )
+        # go through dataloader and get imputed values for each cell
+        # loop through data, and get stochastic approximation of the sum of expression
+        for _, tensors in tqdm(enumerate(control_loader)):
+            x = tensors[REGISTRY_KEYS.X_KEY]
+            batch_index = tensors[REGISTRY_KEYS.BATCH_KEY]
+            y = tensors[REGISTRY_KEYS.PROTEIN_EXP_KEY]
+
+            # first get latent variables
+            inference_outputs = self.module._generic_inference(x=x, y=y, batch_index=batch_index, n_samples=n_samples)
+            z = inference_outputs["z"]
+            s = inference_outputs["s"]
+            library_rna_ = inference_outputs["library_rna"]
+            library_acc_ = inference_outputs["library_acc"]
+
+            # second, get imputed values from background
+            background_generative_outputs = self.module._generic_generative(
+                z=z,
+                s=torch.zeros_like(s),
+                library_rna=library_rna_,
+                library_acc=library_acc_,
+                batch_index=batch_index,
+            )
+            background_exprs_ = background_generative_outputs["px_scale"].mean(0).cpu().numpy()
+            background_chrs_ = background_generative_outputs["paccess_scale"].mean(0).cpu().numpy()
+            py_ = background_generative_outputs["py_"]
+            background_pros_ = (py_["rate_fore"] * (1 - (1 / (1 + torch.exp(-py_["mixing"]))))).mean(0).cpu().numpy()
+            # print(f"shape of background generative outputs: {background_generative_outputs['px_scale'].shape}")
+            # print(f"shape of background_exprs_: {background_exprs_.shape}")
+            # finally, inject mean imputed values into the array
+            background_exprs += background_exprs_.mean(0) / len(control_loader)
+            background_pros += background_pros_.mean(0) / len(control_loader)
+            background_chr += background_chrs_.mean(0) / len(control_loader)
+
+        # STEP 2: get the label mean expression
+        # loop through labels and sample from the prior
+        for _, (key, value) in tqdm(enumerate(labels_torch.items())):
+            # get variational distributions
+            qz_m, qz_v, _ = self.module.background_emp_prior_encoder(value)
+            qs_m, qs_v, _ = self.module.salient_emp_prior_encoder(value)
+
+            # add the mean to the label z and s
+            label_z[np.where(ordered_label_treatment_list == key)[0][0]] = qz_m.cpu().numpy()
+            label_s[np.where(ordered_label_treatment_list == key)[0][0]] = qs_m.cpu().numpy()
+
+            # sample n_samples from the prior
+            z = Normal(qz_m, torch.sqrt(qz_v)).sample((n_samples,))
+            s = Normal(qs_m, torch.sqrt(qs_v)).sample((n_samples,))
+            # repeat for each batch_index
+            z = z.repeat((n_batches, 1, 1))
+            s = s.repeat((n_batches, 1, 1))
+
+            batch_index = torch.arange(n_batches, dtype=torch.long, device=self.module.device)
+            batch_index = batch_index.unsqueeze(1)
+            batch_index = batch_index.repeat((1, n_samples))
+            batch_index = batch_index.unsqueeze(2)
+
+            # final reshapes before sending to neural nets
+            z = z.reshape((n_batches * n_samples, -1))
+            s = s.reshape((n_batches * n_samples, -1))
+            batch_index = batch_index.reshape((n_batches * n_samples, -1))
+            # get imputed values from salient
+            salient_generative_outputs = self.module._generic_generative(
+                z=z,
+                s=s,
+                library_rna=torch.tensor(library_rna),
+                library_acc=torch.tensor(library_acc),
+                batch_index=batch_index,
+            )
+            salient_exprs_ = salient_generative_outputs["px_scale"].cpu().numpy()
+            salient_chrs_ = salient_generative_outputs["paccess_scale"].cpu().numpy()
+            py_ = salient_generative_outputs["py_"]
+            salient_pros_ = (py_["rate_fore"] * (1 - (1 / (1 + torch.exp(-py_["mixing"]))))).cpu().numpy()
+
+            label_exprs[np.where(ordered_label_treatment_list == key)[0][0]] = salient_exprs_.mean(0)
+            label_pros[np.where(ordered_label_treatment_list == key)[0][0]] = salient_pros_.mean(0)
+            label_chr[np.where(ordered_label_treatment_list == key)[0][0]] = salient_chrs_.mean(0)
+
+        # finally, get fold change
+        fold_change_exprs = np.log2(1 + library_rna * label_exprs) - np.log2(1 + library_rna * background_exprs)
+        fold_change_pros = np.log2(0.5 + label_pros) - np.log2(0.5 + background_pros)
+        fold_change_chr = np.log2(1 + library_acc * label_chr) - np.log2(1 + library_acc * background_chr)
+
+        # put in a dataframe
+        fold_change_exprs = pd.DataFrame(
+            fold_change_exprs,
+            index=ordered_label_treatment_list,
+            columns=self.adata.var.index[: self.n_genes],
+        )
+        fold_change_chr = pd.DataFrame(
+            fold_change_chr,
+            index=ordered_label_treatment_list,
+            columns=self.adata.var.index[self.n_genes :],
+        )
+        fold_change_pros = pd.DataFrame(
+            fold_change_pros,
+            index=ordered_label_treatment_list,
+            columns=self.adata_manager.get_state_registry("proteins").values()[0],
+        )
+
+        normalized_exprs = pd.DataFrame(
+            label_exprs,
+            index=ordered_label_treatment_list,
+            columns=self.adata.var.index[: self.n_genes],
+        )
+
+        salient_embedding = pd.DataFrame(
+            label_s,
+            index=ordered_label_treatment_list,
+            columns=[f"salient_{i}" for i in range(self.module.n_salient_latent)],
+        )
+        background_embedding = pd.DataFrame(
+            label_z,
+            index=ordered_label_treatment_list,
+            columns=[f"background_{i}" for i in range(self.module.n_background_latent)],
+        )
+
+        # return in a dictionary
+        return {
+            "fold_change_exp": fold_change_exprs,
+            "fold_change_pro": fold_change_pros,
+            "fold_change_chr": fold_change_chr,
+            "normalized_exp": normalized_exprs,
+            "salient": salient_embedding,
+            "background": background_embedding,
+        }
+
+    @torch.inference_mode()
+    def get_label_prior_synthetic_fold_change(
+        self,
+        labels: dict[str, np.ndarray] | None = None,
+        n_samples: int = 100,
+        library_rna: float = 1e4,
+        library_acc: float = 1e4,
+    ):
+        """
+        Get synthetic fold change for each label and each modality.
+
+        This typically is faster to compute than the full synthetic differential abundance (because it does not
+        require to compute statistical significance for differential abundance for each pair of labels).
+
+        Note that this fold-change calculation is based on the synthetic data generated by the model, and is not
+        directly comparable to the fold-change values obtained from the real data. Notably, the model generates
+        counterfactual data, imputing what would happen if the cells were had the same background but zeroed out
+        salient variables.
+
+        Args:
+        ----
+        labels: List of labels we are interested in for differential computations. If `None`, all labels are used.
+        batch_size: Mini-batch size for data loading into model. Defaults to
+            `scvi.settings.batch_size`.
+        n_samples: Number of posterior samples to use for estimation.
+        library_rna: Library size for scaling RNA measurements.
+        library_acc: Library size for scaling ATAC measurements
+
+        Returns
+        -------
+        A dictionary containing three keys, 'fold_change_exprs', 'fold_change_pros', and 'fold_change_chr',
+        each containing a dataframe with the fold change values for each label.
+        """
+        self._validate_anndata(self.adata)
+
+        # here labels must be a dictionary where the keys are the labels
+        #  and the values are the embeddings to be used for the generation
+        labels_torch = {}
+
+        if labels is None or not isinstance(labels, dict):
+            raise ValueError("Labels must be provided as a dictionary.")
+        else:
+            # check all entries in the dict have the same shape
+            shape_dict = None
+            for key, value in labels.items():
+                if not isinstance(value, np.ndarray):
+                    raise ValueError(f"Labels for {key} must be a numpy array.")
+                else:
+                    labels_torch[key] = torch.tensor(value, dtype=torch.float32, device=self.module.device)
+                if shape_dict is None:
+                    shape_dict = value.shape
+                elif shape_dict != value.shape:
+                    raise ValueError(f"Labels for {key} must have the same shape as the other labels.")
+            n_labels = len(labels)
+
+        # get the number of batches
+        n_batches = self.adata_manager.summary_stats["n_batch"]
+
+        # come up with an ordered list of labels
+        ordered_label_treatment_list = np.array(list(labels_torch.keys()))
+        salient_exprs = np.zeros(shape=(n_labels, self.n_genes))
+        salient_pros = np.zeros(shape=(n_labels, self.summary_stats["n_proteins"]))
+        salient_chr = np.zeros(shape=(n_labels, self.n_regions))
+
+        background_exprs = np.zeros(shape=(n_labels, self.n_genes))
+        background_pros = np.zeros(shape=(n_labels, self.summary_stats["n_proteins"]))
+        background_chr = np.zeros(shape=(n_labels, self.n_regions))
+
+        # loop through labels and sample from the prior
+        for _, (key, value) in tqdm(enumerate(labels_torch.items())):
+            # get variational distributions
+            qz_m, qz_v, _ = self.module.background_emp_prior_encoder(value)
+            qs_m, qs_v, _ = self.module.salient_emp_prior_encoder(value)
+
+            # sample n_samples from the prior
+            z = Normal(qz_m, torch.sqrt(qz_v)).sample((n_samples,))
+            s = Normal(qs_m, torch.sqrt(qs_v)).sample((n_samples,))
+            # repeat for each batch_index
+            z = z.repeat((n_batches, 1, 1))
+            s = s.repeat((n_batches, 1, 1))
+
+            batch_index = torch.arange(n_batches, dtype=torch.long, device=self.module.device)
+            batch_index = batch_index.unsqueeze(1)
+            batch_index = batch_index.repeat((1, n_samples))
+            batch_index = batch_index.unsqueeze(2)
+
+            # final reshapes before sending to neural nets
+            z = z.reshape((n_batches * n_samples, -1))
+            s = s.reshape((n_batches * n_samples, -1))
+            batch_index = batch_index.reshape((n_batches * n_samples, -1))
+            # second, get imputed values from background
+            background_generative_outputs = self.module._generic_generative(
+                z=z,
+                s=torch.zeros_like(s),
+                library_rna=torch.tensor(library_rna),
+                library_acc=torch.tensor(library_acc),
+                batch_index=batch_index,
+            )
+            background_exprs_ = background_generative_outputs["px_scale"].cpu().numpy()
+            background_chrs_ = background_generative_outputs["paccess_scale"].cpu().numpy()
+            py_ = background_generative_outputs["py_"]
+            background_pros_ = (py_["rate_fore"] * (1 - (1 / (1 + torch.exp(-py_["mixing"]))))).cpu().numpy()
+
+            # third, get imputed values from salient
+            salient_generative_outputs = self.module._generic_generative(
+                z=z,
+                s=s,
+                library_rna=torch.tensor(library_rna),
+                library_acc=torch.tensor(library_acc),
+                batch_index=batch_index,
+            )
+            salient_exprs_ = salient_generative_outputs["px_scale"].cpu().numpy()
+            salient_chrs_ = salient_generative_outputs["paccess_scale"].cpu().numpy()
+            py_ = salient_generative_outputs["py_"]
+            salient_pros_ = (py_["rate_fore"] * (1 - (1 / (1 + torch.exp(-py_["mixing"]))))).cpu().numpy()
+
+            # fourth, inject mean imputed values into the array
+            background_exprs[np.where(ordered_label_treatment_list == key)[0][0]] = background_exprs_.mean(0)
+            background_pros[np.where(ordered_label_treatment_list == key)[0][0]] = background_pros_.mean(0)
+            background_chr[np.where(ordered_label_treatment_list == key)[0][0]] = background_chrs_.mean(0)
+            salient_exprs[np.where(ordered_label_treatment_list == key)[0][0]] = salient_exprs_.mean(0)
+            salient_pros[np.where(ordered_label_treatment_list == key)[0][0]] = salient_pros_.mean(0)
+            salient_chr[np.where(ordered_label_treatment_list == key)[0][0]] = salient_chrs_.mean(0)
+
+        # finally, get fold change
+        fold_change_exprs = np.log2(1 + library_rna * salient_exprs) - np.log2(1 + library_rna * background_exprs)
+        fold_change_pros = np.log2(0.5 + salient_pros) - np.log2(0.5 + background_pros)
+        fold_change_chr = np.log2(1 + library_acc * salient_chr) - np.log2(1 + library_acc * background_chr)
+
+        # put in a dataframe
+        fold_change_exprs = pd.DataFrame(
+            fold_change_exprs,
+            index=ordered_label_treatment_list,
+            columns=self.adata.var.index[: self.n_genes],
+        )
+        fold_change_chr = pd.DataFrame(
+            fold_change_chr,
+            index=ordered_label_treatment_list,
+            columns=self.adata.var.index[self.n_genes :],
+        )
+        fold_change_pros = pd.DataFrame(
+            fold_change_pros,
+            index=ordered_label_treatment_list,
+            columns=self.adata_manager.get_state_registry("proteins").values()[0],
+        )
+
+        # return in a dictionary
+        return {
+            "fold_change_exp": fold_change_exprs,
+            "fold_change_pro": fold_change_pros,
+            "fold_change_chr": fold_change_chr,
+        }
+
+    @torch.inference_mode()
+    def get_label_prior_embedding(
+        self,
+        labels: dict[str, np.ndarray] | None = None,
+        representation_kind: str = "salient",
+    ):
+        """
+        Get synthetic fold change for each label and each modality.
+
+        This typically is faster to compute than the full synthetic differential abundance (because it does not
+        require to compute statistical significance for differential abundance for each pair of labels).
+
+        Note that this fold-change calculation is based on the synthetic data generated by the model, and is not
+        directly comparable to the fold-change values obtained from the real data. Notably, the model generates
+        counterfactual data, imputing what would happen if the cells were had the same background but zeroed out
+        salient variables.
+
+        Args:
+        ----
+        labels: List of labels we are interested in for differential computations. If `None`, all labels are used.
+        batch_size: Mini-batch size for data loading into model. Defaults to
+            `scvi.settings.batch_size`.
+        n_samples: Number of posterior samples to use for estimation.
+        library_rna: Library size for scaling RNA measurements.
+        library_acc: Library size for scaling ATAC measurements
+
+        Returns
+        -------
+        A dictionary containing three keys, 'fold_change_exprs', 'fold_change_pros', and 'fold_change_chr',
+        each containing a dataframe with the fold change values for each label.
+        """
+        self._validate_anndata(self.adata)
+
+        # here labels must be a dictionary where the keys are the labels
+        #  and the values are the embeddings to be used for the generation
+        labels_torch = {}
+
+        if labels is None or not isinstance(labels, dict):
+            raise ValueError("Labels must be provided as a dictionary.")
+        else:
+            # check all entries in the dict have the same shape
+            shape_dict = None
+            for key, value in labels.items():
+                if not isinstance(value, np.ndarray):
+                    raise ValueError(f"Labels for {key} must be a numpy array.")
+                else:
+                    labels_torch[key] = torch.tensor(value, dtype=torch.float32, device=self.module.device)
+                if shape_dict is None:
+                    shape_dict = value.shape
+                elif shape_dict != value.shape:
+                    raise ValueError(f"Labels for {key} must have the same shape as the other labels.")
+            n_labels = len(labels)
+
+        labels = labels_torch.copy()
+
+        # come up with an ordered list of labels
+        ordered_label_treatment_list = np.array(list(labels.keys()))
+        salient_mean = np.zeros(shape=(n_labels, self.module.n_salient_latent))
+        background_mean = np.zeros(shape=(n_labels, self.module.n_background_latent))
+
+        # loop through labels and sample from the prior
+        for key, value in tqdm(labels.items()):
+            # get the embedding s and z from the prior
+            qz_m, qz_v, _ = self.module.background_emp_prior_encoder(value)
+            qs_m, qs_v, _ = self.module.salient_emp_prior_encoder(value)
+            # fourth, inject imputed values into the array
+            salient_mean[np.where(ordered_label_treatment_list == key)[0][0]] = qs_m.cpu().numpy()
+            background_mean[np.where(ordered_label_treatment_list == key)[0][0]] = qz_m.cpu().numpy()
+
+        # put in a dataframe
+        salient_mean = pd.DataFrame(
+            salient_mean,
+            index=ordered_label_treatment_list,
+        )
+        background_mean = pd.DataFrame(
+            background_mean,
+            index=ordered_label_treatment_list,
+        )
+
+        if representation_kind == "salient":
+            return salient_mean
+        elif representation_kind == "background":
+            return background_mean
+        else:
+            raise ValueError("representation_kind must be either 'salient' or 'background'")
