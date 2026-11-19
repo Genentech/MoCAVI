@@ -85,13 +85,23 @@ def test_metrics_are_kl_hessians(setup):
             torch.testing.assert_close(G[i], H[0, :, 0], rtol=1e-6, atol=1e-10)
 
 
-def test_feature_response_matches_jvp(setup):
+def test_log_expression_matches_mocavi_fold_change_scale(setup):
     module, z, s, batch, library = setup
+    py = module._generic_generative(z, s, library.log()[:, None], library.log()[:, None], batch)
+    px_scale, py = py["px_scale"], py["py_"]
+    foreground = torch.sigmoid(-py["mixing"]) * py["back_alpha"].exp() * py["fore_scale"]  # background at its mean
+    log_expr = mn.log_expression(module, z, s, batch)
+    torch.testing.assert_close(log_expr["rna"], torch.log2(1 + 1e4 * px_scale))
+    torch.testing.assert_close(log_expr["protein"], torch.log2(0.5 + foreground))
+
+
+def test_lfc_per_step_tends_to_derivative(setup):
+    module, z, s, batch, _ = setup
     v, t = torch.randn_like(s), 1e-6  # small t: the ReLU decoders are only piecewise smooth
-    D = mn.feature_response(module, z, s, batch, library, v, t)
+    L = mn.lfc(module, z, s, batch, v, t)
     for modality in mn.MODALITIES:
-        mean = lambda s_: mn.decoder_mean(module, z, s_, batch, library)[modality]  # noqa: E731, B023
-        torch.testing.assert_close(D[modality], torch.func.jvp(mean, (s,), (v,))[1], rtol=1e-5, atol=1e-7)
+        f = lambda s_: mn.log_expression(module, z, s_, batch)[modality]  # noqa: E731, B023
+        torch.testing.assert_close(L[modality] / t, torch.func.jvp(f, (s,), (v,))[1], rtol=1e-5, atol=1e-7)
 
 
 # ----------------------------------------------------------------------------- standardization

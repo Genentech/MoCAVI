@@ -30,7 +30,7 @@ class Config:
     quantile: float = 1 - 1e-6  # count truncation for the protein Fisher blocks
     alpha: float = 0.01  # subspace projection: nuisance-null share
     beta: float = 0.01  # subspace projection: target-active share
-    t: float = 0.01  # finite-difference step, in local standard deviations
+    t: float = 1.0  # LFC step along v, in local standard deviations
     n_features: int = 20
     batch_size: int = 64
 
@@ -99,13 +99,15 @@ def decode(module, z, s, batch):
     return log_rho, torch.stack([log_back, log_back + torch.log(fore_scale + 1 + 1e-8), logit], -1)
 
 
-def decoder_mean(module, z, s, batch, library):
-    """Means of the decoded distributions: RNA library * rho, protein NB-mixture mean."""
+def log_expression(module, z, s, batch):
+    """Decoded expression of both modalities on MoCAVI's fold-change scale.
+
+    RNA: log2(1 + 1e4 * rho); protein: log2(0.5 + foreground rate (1 - sigmoid(logit)) * r_fore).
+    """
     log_rho, eta = decode(module, z, s, batch)
-    w = torch.sigmoid(eta[..., 2])
     return {
-        "rna": library[:, None] * log_rho.exp(),
-        "protein": w * eta[..., 0].exp() + (1 - w) * eta[..., 1].exp(),
+        "rna": torch.log2(1 + 1e4 * log_rho.exp()),
+        "protein": torch.log2(0.5 + torch.sigmoid(-eta[..., 2]) * eta[..., 1].exp()),
     }
 
 
@@ -256,24 +258,30 @@ def directions(G_t, G_n, Q, sqrt_lam, cfg):
 # -------------------------------------- features --------------------------------------
 
 
-def feature_response(module, z, s, batch, library, v, t):
-    """Centered difference of the decoder means along v, per modality: [mu(s + t v) - mu(s - t v)] / 2t."""
-    up, down = decoder_mean(module, z, s + t * v, batch, library), decoder_mean(module, z, s - t * v, batch, library)
-    return {m: (up[m] - down[m]) / (2 * t) for m in MODALITIES}
+def lfc(module, z, s, batch, v, t):
+    """Centered log2 fold change per step t along v, per modality: [f(s + t v) - f(s - t v)] / 2, f = log_expression."""
+    up, down = log_expression(module, z, s + t * v, batch), log_expression(module, z, s - t * v, batch)
+    return {m: (up[m] - down[m]) / 2 for m in MODALITIES}
 
 
-def top_features(D, names, k):
-    idx = np.argsort(-np.abs(D))[:k]
-    return names[idx], D[idx]
+def top_features(L, names, k):
+    idx = np.argsort(-np.abs(L))[:k]
+    return names[idx], L[idx]
 
 
-def features(module, inputs, v, target, names, cfg):
-    """Top-K target features by |D| at step t, with the top-K overlap at step t/2 (finite-difference stability)."""
+def features(module, inputs, v, target, nuisance, names, cfg):
+    """Top-K target features by |LFC| at step t, their overlap with the top-K at t/2, and both modalities' max |LFC|."""
     v = torch.as_tensor(v)[None]
-    D, D_half = (feature_response(module, *inputs, v, t)[target][0].numpy() for t in (cfg.t, cfg.t / 2))
-    top, responses = top_features(D, names, cfg.n_features)
-    overlap = len(set(top) & set(top_features(D_half, names, cfg.n_features)[0])) / cfg.n_features
-    return {"top_features": top, "top_responses": responses, "half_step_overlap": overlap}
+    L = {m: x[0].numpy() for m, x in lfc(module, *inputs, v, cfg.t).items()}
+    top, top_lfc = top_features(L[target], names, cfg.n_features)
+    half = top_features(lfc(module, *inputs, v, cfg.t / 2)[target][0].numpy(), names, cfg.n_features)[0]
+    return {
+        "top_features": top,
+        "top_lfc": top_lfc,
+        "half_step_overlap": len(set(top) & set(half)) / cfg.n_features,
+        "target_max_lfc": np.abs(L[target]).max(),
+        "nuisance_max_lfc": np.abs(L[nuisance]).max(),
+    }
 
 
 # -------------------------------------- analysis --------------------------------------
@@ -286,13 +294,13 @@ def cell_tensors(data: Data, idx, library=None):
 
 
 def cell_records(module, inputs, G, C, names, cfg):
-    """Records for one cell, for each (target modality, solver); inputs = (z, s, batch, library) of shape (1, ...)."""
+    """Records for one cell, for each (target modality, solver); inputs = (z, s, batch) of shape (1, ...)."""
     Q, sqrt_lam = support(C)
     records = []
     for target, nuisance in (MODALITIES, MODALITIES[::-1]):
         for solver, rec in directions(G[target], G[nuisance], Q, sqrt_lam, cfg).items():
             if "v" in rec:
-                rec |= features(module, inputs, rec["v"], target, names[target], cfg)
+                rec |= features(module, inputs, rec["v"], target, nuisance, names[target], cfg)
             records.append({"target": target, "solver": solver, "support_rank": len(sqrt_lam)} | rec)
     return records
 
@@ -312,7 +320,7 @@ def run(cfg: Config) -> pd.DataFrame:
             z, s, batch, lib = cell_tensors(data, idx, cfg.library)
             G_R, G_P, mass = (x.numpy() for x in pullback_metrics(data.module, z, s, batch, lib, cfg.quantile))
             for i, cell in enumerate(idx):
-                inputs = (z[i : i + 1], s[i : i + 1], batch[i : i + 1], lib[i : i + 1])
+                inputs = (z[i : i + 1], s[i : i + 1], batch[i : i + 1])
                 meta = {"cell": obs.index[cell], "treatment": obs["treatment"].iloc[cell], "protein_mass": mass[i]}
                 G = {"rna": G_R[i], "protein": G_P[i]}
                 records += [meta | r for r in cell_records(data.module, inputs, G, C[start + i], names, cfg)]
